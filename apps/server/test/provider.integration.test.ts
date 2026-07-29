@@ -385,10 +385,12 @@ if (databaseUrl === undefined) {
       expect(disabledResponse.status).toBe(401);
     });
 
-    test("bounds wallet challenge limits after client and origin validation", async () => {
+    test("partitions wallet challenge limits after client and origin validation", async () => {
       const rateLimitedWallet = privateKeyToAccount(
         "0x1111111111111111111111111111111111111111111111111111111111111111",
       );
+      const limitedIp = "198.51.100.10";
+      const otherIp = "198.51.100.11";
       const [beforeInvalidRequest] = await database.sql<{ count: string }[]>`
         SELECT count(*)::text AS "count"
         FROM "rate_limit"
@@ -408,6 +410,7 @@ if (databaseUrl === undefined) {
           },
           method: "POST",
         },
+        bunServer(limitedIp),
       );
       const [afterInvalidRequest] = await database.sql<{ count: string }[]>`
         SELECT count(*)::text AS "count"
@@ -417,7 +420,7 @@ if (databaseUrl === undefined) {
       expect(invalidRequest.status).toBe(404);
       expect(afterInvalidRequest?.count).toBe(beforeInvalidRequest?.count);
 
-      const key = `identity-v1:wallet-challenge:pledge-cash:${origin}`;
+      const key = `identity-v1:wallet-challenge:pledge-cash:${origin}:${limitedIp}:${rateLimitedWallet.address.toLowerCase()}`;
       await database.db
         .insert(rateLimit)
         .values({
@@ -430,27 +433,133 @@ if (databaseUrl === undefined) {
           target: rateLimit.key,
         });
 
-      const requestChallenge = (walletAddress: string) =>
-        app.request("https://identity.test/v1/wallet/challenges", {
+      const requestChallenge = (walletAddress: string, clientIp: string) =>
+        app.request(
+          "https://identity.test/v1/wallet/challenges",
+          {
+            body: JSON.stringify({
+              chainId: 999,
+              clientId: "pledge-cash",
+              walletAddress,
+            }),
+            headers: {
+              "Content-Type": "application/json",
+              Origin: origin,
+            },
+            method: "POST",
+          },
+          bunServer(clientIp),
+        );
+
+      const limitedResponse = await requestChallenge(
+        rateLimitedWallet.address,
+        limitedIp,
+      );
+      const rotatedAddressResponse = await requestChallenge(
+        hostedWallet.address,
+        limitedIp,
+      );
+      const rotatedIpResponse = await requestChallenge(
+        rateLimitedWallet.address,
+        otherIp,
+      );
+      await database.db.delete(rateLimit).where(eq(rateLimit.key, key));
+      expect(limitedResponse.status).toBe(429);
+      expect(rotatedAddressResponse.status).toBe(201);
+      expect(rotatedIpResponse.status).toBe(201);
+    });
+
+    test("rate limits wallet grants only after challenge validation", async () => {
+      const grantWallet = privateKeyToAccount(
+        "0x4444444444444444444444444444444444444444444444444444444444444444",
+      );
+      const limitedIp = "198.51.100.20";
+      const otherIp = "198.51.100.21";
+      const [beforeInvalidRequest] = await database.sql<{ count: string }[]>`
+        SELECT count(*)::text AS "count"
+        FROM "rate_limit"
+        WHERE "key" LIKE 'identity-v1:wallet-grant:%'
+      `;
+      const invalidRequest = await app.request(
+        "https://identity.test/v1/wallet/grants",
+        {
+          body: JSON.stringify({
+            clientId: "attacker-selected-client",
+            message: "not a SIWE message",
+            signature: `0x${"00".repeat(65)}`,
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Origin: "https://attacker.invalid",
+          },
+          method: "POST",
+        },
+        bunServer(limitedIp),
+      );
+      const [afterInvalidRequest] = await database.sql<{ count: string }[]>`
+        SELECT count(*)::text AS "count"
+        FROM "rate_limit"
+        WHERE "key" LIKE 'identity-v1:wallet-grant:%'
+      `;
+      expect(invalidRequest.status).toBe(400);
+      expect(afterInvalidRequest?.count).toBe(beforeInvalidRequest?.count);
+
+      const challengeResponse = await app.request(
+        "https://identity.test/v1/wallet/challenges",
+        {
           body: JSON.stringify({
             chainId: 999,
             clientId: "pledge-cash",
-            walletAddress,
+            walletAddress: grantWallet.address,
           }),
           headers: {
             "Content-Type": "application/json",
             Origin: origin,
           },
           method: "POST",
+        },
+        bunServer(limitedIp),
+      );
+      const challenge = WalletChallengeResponseSchema.parse(
+        await challengeResponse.json(),
+      );
+      const key = `identity-v1:wallet-grant:pledge-cash:${origin}:${limitedIp}:${grantWallet.address.toLowerCase()}`;
+      await database.db
+        .insert(rateLimit)
+        .values({
+          count: 30,
+          key,
+          lastRequest: Date.now(),
+        })
+        .onConflictDoUpdate({
+          set: { count: 30, lastRequest: Date.now() },
+          target: rateLimit.key,
         });
 
-      const firstResponse = await requestChallenge(rateLimitedWallet.address);
-      const rotatedAddressResponse = await requestChallenge(
-        hostedWallet.address,
-      );
+      const grantBody = JSON.stringify({
+        clientId: "pledge-cash",
+        message: challenge.message,
+        signature: await grantWallet.signMessage({
+          message: challenge.message,
+        }),
+      });
+      const requestGrant = (clientIp: string) =>
+        app.request(
+          "https://identity.test/v1/wallet/grants",
+          {
+            body: grantBody,
+            headers: {
+              "Content-Type": "application/json",
+              Origin: origin,
+            },
+            method: "POST",
+          },
+          bunServer(clientIp),
+        );
+
+      expect((await requestGrant(limitedIp)).status).toBe(429);
+      expect((await requestGrant(otherIp)).status).toBe(201);
       await database.db.delete(rateLimit).where(eq(rateLimit.key, key));
-      expect(firstResponse.status).toBe(429);
-      expect(rotatedAddressResponse.status).toBe(429);
     });
 
     test("links a wallet, exchanges its one-time grant, and preserves one global owner", async () => {
@@ -1018,6 +1127,18 @@ if (databaseUrl === undefined) {
 
 function basic(clientId: string, secret: string): string {
   return `Basic ${Buffer.from(`${clientId}:${secret}`).toString("base64")}`;
+}
+
+function bunServer(address: string): {
+  requestIP: () => { address: string; family: "IPv4"; port: number };
+} {
+  return {
+    requestIP: () => ({
+      address,
+      family: "IPv4",
+      port: 443,
+    }),
+  };
 }
 
 async function authorizeCode(input: {

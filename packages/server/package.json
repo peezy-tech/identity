@@ -15,15 +15,15 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && bun build src/index.ts --outdir dist --target node --external jose --sourcemap=external",
     "test": "bun test",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@peezy.tech/identity": "0.1.0",
     "jose": "6.2.4"
   },
   "devDependencies": {
+    "@peezy.tech/identity": "workspace:*",
     "typescript": "5.9.3"
   },
   "publishConfig": {

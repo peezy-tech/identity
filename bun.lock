@@ -14,6 +14,7 @@
       "name": "@peezy.tech/identity-provider",
       "version": "0.1.0",
       "dependencies": {
+        "@better-auth/core": "1.7.0-rc.1",
         "@better-auth/drizzle-adapter": "1.7.0-rc.1",
         "@better-auth/oauth-provider": "1.7.0-rc.1",
         "@peezy.tech/identity": "workspace:*",
@@ -45,10 +46,10 @@
       "name": "@peezy.tech/identity-server",
       "version": "0.1.0",
       "dependencies": {
-        "@peezy.tech/identity": "0.1.0",
         "jose": "6.2.4",
       },
       "devDependencies": {
+        "@peezy.tech/identity": "workspace:*",
         "typescript": "5.9.3",
       },
     },

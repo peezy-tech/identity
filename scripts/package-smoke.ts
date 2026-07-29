@@ -15,12 +15,13 @@ try {
   await assertServerPackageContract();
   const artifacts = join(temporaryRoot, "artifacts");
   await mkdir(artifacts);
-  const identity = await pack(join(root, "packages/identity"), artifacts);
+  await pack(join(root, "packages/identity"), artifacts);
   const server = await pack(join(root, "packages/server"), artifacts);
+  await assertServerArtifactContract();
 
   await Promise.all([
-    smokeConsumer("npm", temporaryRoot, artifacts, identity, server),
-    smokeConsumer("bun", temporaryRoot, artifacts, identity, server),
+    smokeConsumer("npm", temporaryRoot, artifacts, server),
+    smokeConsumer("bun", temporaryRoot, artifacts, server),
   ]);
   console.log("SDK tarballs install and execute with npm/Node and Bun.");
 } finally {
@@ -32,16 +33,33 @@ async function assertServerPackageContract(): Promise<void> {
     join(root, "packages/server/package.json"),
   ).json()) as {
     dependencies?: Record<string, string>;
-    peerDependenciesMeta?: Record<string, { optional?: boolean }>;
-    version?: string;
+    optionalDependencies?: Record<string, string>;
+    peerDependencies?: Record<string, string>;
   };
-  if (
-    manifest.dependencies?.["@peezy.tech/identity"] !== manifest.version ||
-    manifest.peerDependenciesMeta?.["@peezy.tech/identity"]?.optional === true
-  ) {
+  const manifests = [
+    manifest.dependencies,
+    manifest.optionalDependencies,
+    manifest.peerDependencies,
+  ];
+  if (manifests.some((entries) => entries?.["@peezy.tech/identity"])) {
     throw new Error(
-      "@peezy.tech/identity-server must require its matching identity runtime",
+      "@peezy.tech/identity-server must not require the unpublished identity package",
     );
+  }
+}
+
+async function assertServerArtifactContract(): Promise<void> {
+  const [bundle, declarations, responseTypes] = await Promise.all([
+    Bun.file(join(root, "packages/server/dist/index.js")).text(),
+    Bun.file(join(root, "packages/server/dist/index.d.ts")).text(),
+    Bun.file(join(root, "packages/server/dist/types.d.ts")).text(),
+  ]);
+  if (
+    [bundle, declarations, responseTypes].some((artifact) =>
+      artifact.includes("@peezy.tech/identity"),
+    )
+  ) {
+    throw new Error("The server artifact must bundle its identity runtime");
   }
 }
 
@@ -65,7 +83,6 @@ async function smokeConsumer(
   packageManager: "bun" | "npm",
   temporaryRoot: string,
   artifacts: string,
-  identity: PackResult,
   server: PackResult,
 ): Promise<void> {
   const directory = join(temporaryRoot, packageManager);
@@ -82,9 +99,6 @@ async function smokeConsumer(
             artifacts,
             server.filename,
           )}`,
-        },
-        overrides: {
-          "@peezy.tech/identity": `file:${join(artifacts, identity.filename)}`,
         },
       },
       null,

@@ -39,6 +39,7 @@ export class WalletGrantError extends Error {
 export async function createWalletChallenge(input: {
   address: string;
   chainId: number;
+  clientIp: string;
   clientId: string;
   db: IdentityDb;
   now?: Date;
@@ -62,10 +63,11 @@ export async function createWalletChallenge(input: {
   }
 
   const issuedAt = input.now ?? new Date();
+  const address = getAddress(input.address).toLowerCase() as `0x${string}`;
   if (
     !(await consumeRateLimit({
       db: input.db,
-      key: `wallet-challenge:${client.id}:${origin}`,
+      key: `wallet-challenge:${client.id}:${origin}:${input.clientIp}:${address}`,
       limit: 20,
       now: issuedAt.getTime(),
       windowMs: 5 * 60 * 1_000,
@@ -75,7 +77,6 @@ export async function createWalletChallenge(input: {
   }
   const expiresAt = new Date(issuedAt.getTime() + WALLET_CHALLENGE_TTL_MS);
   const nonce = randomBytes(24).toString("hex");
-  const address = getAddress(input.address).toLowerCase() as `0x${string}`;
   const domain = new URL(origin).host;
   const purpose = input.purpose ?? "sign-in";
   const statement =
@@ -125,6 +126,7 @@ export async function createWalletChallenge(input: {
 }
 
 export async function createWalletGrant(input: {
+  clientIp?: string;
   clientId: string;
   db: IdentityDb;
   message: string;
@@ -167,6 +169,19 @@ export async function createWalletGrant(input: {
   }
   if (challenge.expiresAt.getTime() <= now.getTime()) {
     throw new WalletGrantError(400, "SIWE challenge has expired");
+  }
+  if (
+    input.clientIp !== undefined &&
+    input.origin !== undefined &&
+    !(await consumeRateLimit({
+      db: input.db,
+      key: `wallet-grant:${challenge.clientId}:${new URL(challenge.uri).origin}:${input.clientIp}:${challenge.address.toLowerCase()}`,
+      limit: 30,
+      now: now.getTime(),
+      windowMs: 5 * 60 * 1_000,
+    }))
+  ) {
+    throw new WalletGrantError(429, "Too many identity requests");
   }
 
   const expectedMessage = createSiweMessage({

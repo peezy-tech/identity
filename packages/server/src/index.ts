@@ -8,11 +8,6 @@ import {
   WalletGrantExchangeResponseSchema,
   WalletGrantIssueRequestSchema,
   WalletGrantResponseSchema,
-  type WalletGrantExchangeResponse,
-  type WalletGrantResponse,
-  type IdentityMeResponse,
-  type SocialLinkHandoffResponse,
-  type WalletChallengeResponse,
 } from "@peezy.tech/identity";
 import {
   createRemoteJWKSet,
@@ -20,6 +15,24 @@ import {
   type JWTPayload,
   type JWTVerifyOptions,
 } from "jose";
+
+import type {
+  IdentityMeResponse,
+  SocialLinkHandoffResponse,
+  WalletChallengeResponse,
+  WalletGrantExchangeResponse,
+  WalletGrantResponse,
+} from "./types";
+
+export type {
+  IdentityCredential,
+  IdentityMeResponse,
+  PeezyUser,
+  SocialLinkHandoffResponse,
+  WalletChallengeResponse,
+  WalletGrantExchangeResponse,
+  WalletGrantResponse,
+} from "./types";
 
 export type IdentityPrincipal = {
   claims: JWTPayload;

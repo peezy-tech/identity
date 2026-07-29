@@ -3,8 +3,9 @@
 Server-side helpers for integrating a confidential peezy.tech application with
 the shared identity provider.
 
-Installing this package also installs `@peezy.tech/identity`, whose shared
-runtime schemas and TypeScript types are used by the server helpers.
+The release tarball bundles the shared runtime schemas used by these helpers,
+so it installs without registry access to `@peezy.tech/identity`. Install the
+public identity package separately only when importing its contracts directly.
 
 The package verifies audience-bound access tokens through the provider JWKS and
 supports the one-time wallet-grant and social-link handoff flows. Keep the

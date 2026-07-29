@@ -13,6 +13,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@better-auth/core": "1.7.0-rc.1",
     "@better-auth/drizzle-adapter": "1.7.0-rc.1",
     "@better-auth/oauth-provider": "1.7.0-rc.1",
     "@peezy.tech/identity": "workspace:*",

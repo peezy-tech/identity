@@ -7,8 +7,10 @@ import {
   WalletGrantExchangeRequestSchema,
   WalletGrantRequestSchema,
 } from "@peezy.tech/identity";
+import { getIPFromHeader, normalizeIP } from "@better-auth/core/utils/ip";
 import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { getConnInfo } from "hono/bun";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
@@ -167,10 +169,15 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
   app.post("/v1/wallet/challenges", async (context) => {
     const origin = requiredOrigin(context.req.raw);
     const body = WalletChallengeRequestSchema.parse(await boundedJson(context));
+    const clientIp = requestClientIp(
+      context,
+      dependencies.config.trustedProxies,
+    );
     return context.json(
       await createWalletChallenge({
         address: body.walletAddress,
         chainId: body.chainId,
+        clientIp,
         clientId: body.clientId,
         db: dependencies.db,
         origin,
@@ -186,14 +193,10 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     const identitySession = await dependencies.auth.api.getSession({
       headers: context.req.raw.headers,
     });
-    await requireRateLimit(dependencies.db, {
-      key: `wallet-grant:${body.clientId}:${origin}`,
-      limit: 30,
-      windowMs: 5 * 60 * 1_000,
-    });
     return context.json(
       await createWalletGrant({
         ...body,
+        clientIp: requestClientIp(context, dependencies.config.trustedProxies),
         db: dependencies.db,
         origin,
         ...(identitySession === null
@@ -366,6 +369,32 @@ function requiredOrigin(request: Request): string {
   } catch {
     throw new RequestError(400, "Origin header is invalid");
   }
+}
+
+function requestClientIp(
+  context: Parameters<typeof getConnInfo>[0],
+  trustedProxies: string[],
+): string {
+  let remoteAddress: string | undefined;
+  try {
+    remoteAddress = getConnInfo(context).remote.address;
+  } catch {
+    // Hono's in-process test client has no Bun server connection metadata.
+  }
+  if (remoteAddress === undefined) {
+    return "unknown";
+  }
+
+  const normalizedRemote = normalizeIP(remoteAddress);
+  const forwardedFor = context.req.raw.headers.get("x-forwarded-for");
+  if (forwardedFor === null || trustedProxies.length === 0) {
+    return normalizedRemote;
+  }
+  return (
+    getIPFromHeader(`${forwardedFor}, ${remoteAddress}`, {
+      trustedProxies,
+    }) ?? normalizedRemote
+  );
 }
 
 async function authenticateAppClient(
