@@ -34,6 +34,7 @@ type TelegramOAuthTokens = {
 };
 
 export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
+  const secureCookies = new URL(config.baseUrl).protocol === "https:";
   const socialProviderNames = configuredSocialProviders(config.socialProviders);
   const github = config.socialProviders.github;
   const apple = config.socialProviders.apple;
@@ -186,10 +187,13 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
     advanced: {
       cookiePrefix: "peezy-identity",
       database: { generateId: "uuid" },
+      defaultCookieAttributes: {
+        sameSite: secureCookies ? "none" : "lax",
+      },
       ipAddress: {
         trustedProxies: config.trustedProxies,
       },
-      useSecureCookies: new URL(config.baseUrl).protocol === "https:",
+      useSecureCookies: secureCookies,
     },
     rateLimit: {
       enabled: true,

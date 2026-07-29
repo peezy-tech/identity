@@ -27,6 +27,7 @@
         "zod": "4.4.3",
       },
       "devDependencies": {
+        "drizzle-kit": "0.31.10",
         "typescript": "5.9.3",
       },
     },
@@ -44,18 +45,12 @@
       "name": "@peezy.tech/identity-server",
       "version": "0.1.0",
       "dependencies": {
+        "@peezy.tech/identity": "0.1.0",
         "jose": "6.2.4",
       },
       "devDependencies": {
-        "@peezy.tech/identity": "workspace:*",
         "typescript": "5.9.3",
       },
-      "peerDependencies": {
-        "@peezy.tech/identity": "0.1.0",
-      },
-      "optionalPeers": [
-        "@peezy.tech/identity",
-      ],
     },
   },
   "overrides": {

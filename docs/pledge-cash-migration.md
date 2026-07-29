@@ -47,7 +47,17 @@ as a cross-database foreign key.
 
 ## Cutover
 
-1. Import identity rows while preserving all user UUIDs. Dry-run first:
+1. Deploy the provider schema and service without directing client traffic to
+   it, then configure the PledgeCash compatibility adapter.
+2. Enter an identity-write maintenance window across every PledgeCash
+   instance. Stop user creation and every provider, email, and wallet
+   credential mutation; disable background writers and legacy database
+   triggers; drain in-flight identity requests; and revoke or otherwise block
+   the legacy credential writer role. Existing product reads and already-issued
+   sessions may remain available. Keep this write barrier in place through
+   step 6.
+3. After the write barrier is confirmed, import identity rows while preserving
+   all user UUIDs. Run the final dry-run against the quiesced source:
 
    ```sh
    PLEDGE_DATABASE_URL=postgres://... \
@@ -64,13 +74,21 @@ as a cross-database foreign key.
    bun --cwd apps/server import:pledge-cash --apply
    ```
 
-2. Compare row counts, provider-subject uniqueness, normalized wallet
-   ownership, and the importer's source-to-target ID mappings.
-3. Deploy the provider and configure the PledgeCash compatibility adapter.
-4. Switch credential writes to Identity exactly once.
-5. Continue accepting legacy PledgeCash sessions until their original expiry,
-   while issuing new product sessions through Identity.
-6. Remove legacy credential writes and database triggers after the compatibility
-   window and reconciliation complete.
+   A preliminary dry-run may happen before the maintenance window, but it does
+   not replace this final quiesced read. If any legacy credential write occurs
+   after the final dry-run starts, do not cut over; restore the barrier and
+   repeat the final import and verification.
+
+4. While legacy writes remain blocked, compare row counts, provider-subject
+   uniqueness, normalized wallet ownership, and the importer's source-to-target
+   ID mappings.
+5. Atomically enable Identity as the sole credential writer and disable the
+   legacy credential-write routes exactly once.
+6. Remove the maintenance barrier only after confirming new credential writes
+   reach Identity. Continue accepting legacy PledgeCash sessions until their
+   original expiry while issuing new product sessions through Identity.
+7. Reconcile the source and target again after cutover.
+8. Remove legacy credential writes, writer privileges, and database triggers
+   after the compatibility window and reconciliation complete.
 
 Permanent dual writing is forbidden.

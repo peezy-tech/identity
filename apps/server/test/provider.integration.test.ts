@@ -28,7 +28,7 @@ import { seedConfiguredClients } from "../src/clients";
 import type { IdentityConfig } from "../src/config";
 import { HOSTED_WALLET_STATEMENT } from "../src/constants";
 import { createDbClient, type IdentityDbClient } from "../src/db/client";
-import { user, walletAddress } from "../src/db/schema";
+import { rateLimit, user, walletAddress } from "../src/db/schema";
 import { identityMe } from "../src/identity";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -218,6 +218,10 @@ if (databaseUrl === undefined) {
       expect(verifyResponse.headers.get("set-cookie")).toContain(
         "peezy-identity.session_token",
       );
+      expect(verifyResponse.headers.get("set-cookie")).toContain(
+        "SameSite=None",
+      );
+      expect(verifyResponse.headers.get("set-cookie")).toContain("Secure");
       const identityCookie = responseCookie(
         verifyResponse,
         "peezy-identity.session_token",
@@ -360,6 +364,43 @@ if (databaseUrl === undefined) {
         },
       );
       expect(disabledResponse.status).toBe(401);
+    });
+
+    test("partitions wallet challenge limits by normalized address", async () => {
+      const rateLimitedWallet = privateKeyToAccount(
+        "0x1111111111111111111111111111111111111111111111111111111111111111",
+      );
+      const key = `identity-v1:wallet-challenge:pledge-cash:${origin}:${rateLimitedWallet.address.toLowerCase()}`;
+      await database.db
+        .insert(rateLimit)
+        .values({
+          count: 20,
+          key,
+          lastRequest: Date.now(),
+        })
+        .onConflictDoUpdate({
+          set: { count: 20, lastRequest: Date.now() },
+          target: rateLimit.key,
+        });
+
+      const requestChallenge = (walletAddress: string) =>
+        app.request("https://identity.test/v1/wallet/challenges", {
+          body: JSON.stringify({
+            chainId: 999,
+            clientId: "pledge-cash",
+            walletAddress,
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Origin: origin,
+          },
+          method: "POST",
+        });
+
+      expect((await requestChallenge(rateLimitedWallet.address)).status).toBe(
+        429,
+      );
+      expect((await requestChallenge(hostedWallet.address)).status).toBe(201);
     });
 
     test("links a wallet, exchanges its one-time grant, and preserves one global owner", async () => {

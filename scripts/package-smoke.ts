@@ -12,6 +12,7 @@ const temporaryRoot = await mkdtemp(
 );
 
 try {
+  await assertServerPackageContract();
   const artifacts = join(temporaryRoot, "artifacts");
   await mkdir(artifacts);
   const identity = await pack(join(root, "packages/identity"), artifacts);
@@ -24,6 +25,24 @@ try {
   console.log("SDK tarballs install and execute with npm/Node and Bun.");
 } finally {
   await rm(temporaryRoot, { force: true, recursive: true });
+}
+
+async function assertServerPackageContract(): Promise<void> {
+  const manifest = (await Bun.file(
+    join(root, "packages/server/package.json"),
+  ).json()) as {
+    dependencies?: Record<string, string>;
+    peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+    version?: string;
+  };
+  if (
+    manifest.dependencies?.["@peezy.tech/identity"] !== manifest.version ||
+    manifest.peerDependenciesMeta?.["@peezy.tech/identity"]?.optional === true
+  ) {
+    throw new Error(
+      "@peezy.tech/identity-server must require its matching identity runtime",
+    );
+  }
 }
 
 async function pack(
@@ -59,11 +78,13 @@ async function smokeConsumer(
         private: true,
         type: "module",
         dependencies: {
-          "@peezy.tech/identity": `file:${join(artifacts, identity.filename)}`,
           "@peezy.tech/identity-server": `file:${join(
             artifacts,
             server.filename,
           )}`,
+        },
+        overrides: {
+          "@peezy.tech/identity": `file:${join(artifacts, identity.filename)}`,
         },
       },
       null,
@@ -74,23 +95,10 @@ async function smokeConsumer(
     join(directory, "index.mjs"),
     `
       import {
-        IdentityCapabilitiesSchema,
-        PeezyUserSchema,
-      } from "@peezy.tech/identity";
-      import {
         bearerToken,
         createAccessTokenVerifier,
       } from "@peezy.tech/identity-server";
 
-      const user = PeezyUserSchema.parse({
-        createdAt: new Date(0).toISOString(),
-        id: "00000000-0000-4000-8000-000000000001",
-        status: "active",
-      });
-      const capabilities = IdentityCapabilitiesSchema.parse({
-        accountCreation: { social: true, wallet: true },
-        socialProviders: ["github"],
-      });
       const token = bearerToken("Bearer package-smoke");
       const verifier = createAccessTokenVerifier({
         audience: "package-smoke",
@@ -98,8 +106,6 @@ async function smokeConsumer(
       });
 
       if (
-        user.id !== "00000000-0000-4000-8000-000000000001" ||
-        capabilities.socialProviders[0] !== "github" ||
         token !== "package-smoke" ||
         typeof verifier !== "function"
       ) {

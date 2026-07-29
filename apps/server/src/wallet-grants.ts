@@ -188,7 +188,7 @@ export async function createWalletGrant(input: {
   const identity = await input.db.transaction(async (tx) => {
     const normalizedAddress = getAddress(challenge.address).toLowerCase();
     await tx.execute(
-      sql`SELECT pg_advisory_xact_lock(hashtext(${normalizedAddress}))`,
+      sql`SELECT pg_advisory_xact_lock(hashtext(${`wallet-principal:evm:${normalizedAddress}`}))`,
     );
 
     const consumed = await tx
