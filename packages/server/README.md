@@ -12,21 +12,21 @@ application client secret on the server.
 
 ```ts
 import {
-  createIdentityAccessTokenVerifier,
+  createAccessTokenVerifier,
   getIdentity,
 } from "@peezy.tech/identity-server";
 
-const verify = createIdentityAccessTokenVerifier({
+const verify = createAccessTokenVerifier({
   audience: "my-app",
   issuer: "https://identity.peezy.tech/api/auth",
 });
 
-const claims = await verify(token);
+const principal = await verify(token);
 const identity = await getIdentity({
   baseUrl: "https://identity.peezy.tech",
   clientId: "my-app",
   clientSecret: process.env.IDENTITY_APP_CLIENT_SECRET!,
-  subject: claims.sub,
+  subject: principal.subject,
 });
 ```
 

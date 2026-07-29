@@ -58,6 +58,7 @@ export function createIdentityClient(options: IdentityClientOptions) {
         WalletGrantResponseSchema,
         {
           body,
+          credentials: "include",
           method: "POST",
         },
       ),
