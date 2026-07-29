@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1785332031684,
+      "tag": "0000_romantic_layla_miller",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1785332046399,
+      "tag": "0001_wallet_ownership",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1785332067376,
+      "tag": "0002_wandering_prima",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1785332329547,
+      "tag": "0003_glossy_amazoness",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1785332895171,
+      "tag": "0004_loving_wolf_cub",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1785332970738,
+      "tag": "0005_misty_living_lightning",
+      "breakpoints": true
+    }
+  ]
+}

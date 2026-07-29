@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: peezy_identity
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d peezy_identity"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - identity-postgres:/var/lib/postgresql/data
+
+  identity:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: apps/server/.env
+        required: true
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/peezy_identity
+    ports:
+      - "127.0.0.1:8790:8790"
+
+volumes:
+  identity-postgres:
