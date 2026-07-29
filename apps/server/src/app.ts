@@ -167,11 +167,6 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
   app.post("/v1/wallet/challenges", async (context) => {
     const origin = requiredOrigin(context.req.raw);
     const body = WalletChallengeRequestSchema.parse(await boundedJson(context));
-    await requireRateLimit(dependencies.db, {
-      key: `wallet-challenge:${body.clientId}:${origin}:${body.walletAddress}`,
-      limit: 20,
-      windowMs: 5 * 60 * 1_000,
-    });
     return context.json(
       await createWalletChallenge({
         address: body.walletAddress,

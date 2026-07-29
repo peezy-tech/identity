@@ -21,12 +21,13 @@ import {
   walletGrant,
   walletPrincipal,
 } from "./db/schema";
+import { consumeRateLimit } from "./rate-limit";
 
 export const WALLET_CHALLENGE_TTL_MS = 10 * 60 * 1_000;
 export const WALLET_GRANT_TTL_MS = 5 * 60 * 1_000;
 
 export class WalletGrantError extends Error {
-  readonly status: 400 | 401 | 403 | 404 | 409;
+  readonly status: 400 | 401 | 403 | 404 | 409 | 429;
 
   constructor(status: WalletGrantError["status"], message: string) {
     super(message);
@@ -61,14 +62,24 @@ export async function createWalletChallenge(input: {
   }
 
   const issuedAt = input.now ?? new Date();
+  if (
+    !(await consumeRateLimit({
+      db: input.db,
+      key: `wallet-challenge:${client.id}:${origin}`,
+      limit: 20,
+      now: issuedAt.getTime(),
+      windowMs: 5 * 60 * 1_000,
+    }))
+  ) {
+    throw new WalletGrantError(429, "Too many identity requests");
+  }
   const expiresAt = new Date(issuedAt.getTime() + WALLET_CHALLENGE_TTL_MS);
   const nonce = randomBytes(24).toString("hex");
   const address = getAddress(input.address).toLowerCase() as `0x${string}`;
   const domain = new URL(origin).host;
+  const purpose = input.purpose ?? "sign-in";
   const statement =
-    input.purpose === "link"
-      ? client.walletLinkSiweStatement
-      : client.siweStatement;
+    purpose === "link" ? client.walletLinkSiweStatement : client.siweStatement;
   const message = createSiweMessage({
     address: getAddress(address),
     chainId: input.chainId,
@@ -93,6 +104,7 @@ export async function createWalletChallenge(input: {
       expiresAt,
       issuedAt,
       nonce,
+      purpose,
       statement,
       uri: origin,
     });
@@ -218,10 +230,18 @@ export async function createWalletGrant(input: {
       .for("update")
       .limit(1);
 
+    if (challenge.purpose === "link" && input.sessionSubject === undefined) {
+      throw new WalletGrantError(
+        401,
+        "An authenticated identity session is required to link a wallet",
+      );
+    }
+    const linkSubject =
+      challenge.purpose === "link" ? input.sessionSubject : undefined;
     if (
-      input.sessionSubject !== undefined &&
+      linkSubject !== undefined &&
       existingPrincipal !== undefined &&
-      existingPrincipal.userId !== input.sessionSubject
+      existingPrincipal.userId !== linkSubject
     ) {
       throw new WalletGrantError(
         409,
@@ -239,7 +259,7 @@ export async function createWalletGrant(input: {
       );
     }
 
-    let subject = input.sessionSubject ?? existingPrincipal?.userId;
+    let subject = linkSubject ?? existingPrincipal?.userId;
     if (subject !== undefined) {
       const [existingUser] = await tx
         .select()

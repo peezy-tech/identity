@@ -240,7 +240,7 @@ function createIdentityDatabaseAdapter(db: IdentityDb) {
       ...adapter,
       findOne: async (...findOneArgs: Parameters<typeof adapter.findOne>) => {
         const [input] = findOneArgs;
-        return adapter.findOne({
+        const result = await adapter.findOne({
           ...input,
           ...(input.model === "walletAddress" && input.where !== undefined
             ? {
@@ -252,9 +252,38 @@ function createIdentityDatabaseAdapter(db: IdentityDb) {
               }
             : {}),
         });
+        if (
+          (input.model === "user" && isDisabledIdentityUser(result)) ||
+          (input.model === "session" &&
+            isDisabledIdentityUser((result as { user?: unknown } | null)?.user))
+        ) {
+          return null;
+        }
+        return result;
+      },
+      findMany: async (
+        ...findManyArgs: Parameters<typeof adapter.findMany>
+      ) => {
+        const [input] = findManyArgs;
+        const results = await adapter.findMany(input);
+        return input.model === "session"
+          ? results.filter(
+              (result) =>
+                !isDisabledIdentityUser((result as { user?: unknown }).user),
+            )
+          : results;
       },
     };
   };
+}
+
+function isDisabledIdentityUser(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "status" in value &&
+    value.status === "disabled"
+  );
 }
 
 async function verifyHostedWalletSignature(

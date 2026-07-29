@@ -296,6 +296,7 @@ if (databaseUrl === undefined) {
       expect(successfulToken.status).toBe(200);
       const tokenBody = (await successfulToken.json()) as {
         access_token: string;
+        refresh_token: string;
       };
       const audience = decodeJwt(tokenBody.access_token).aud;
       expect(Array.isArray(audience) ? audience : [audience]).toContain(
@@ -323,6 +324,24 @@ if (databaseUrl === undefined) {
         .update(user)
         .set({ status: "disabled" })
         .where(eq(user.id, verified.user.id));
+      const disabledSessionResponse = await app.request(
+        "https://identity.test/api/auth/get-session",
+        {
+          headers: { Cookie: identityCookie },
+        },
+      );
+      expect(disabledSessionResponse.status).toBe(200);
+      expect(await disabledSessionResponse.json()).toBeNull();
+      const disabledRefreshResponse = await refreshAccessToken({
+        app,
+        oidcSecret,
+        refreshToken: tokenBody.refresh_token,
+      });
+      expect(disabledRefreshResponse.status).toBe(400);
+      expect(await disabledRefreshResponse.json()).toMatchObject({
+        error: "invalid_request",
+      });
+
       const disabledNonceResponse = await app.request(
         "https://identity.test/api/auth/siwe/nonce",
         {
@@ -366,11 +385,39 @@ if (databaseUrl === undefined) {
       expect(disabledResponse.status).toBe(401);
     });
 
-    test("partitions wallet challenge limits by normalized address", async () => {
+    test("bounds wallet challenge limits after client and origin validation", async () => {
       const rateLimitedWallet = privateKeyToAccount(
         "0x1111111111111111111111111111111111111111111111111111111111111111",
       );
-      const key = `identity-v1:wallet-challenge:pledge-cash:${origin}:${rateLimitedWallet.address.toLowerCase()}`;
+      const [beforeInvalidRequest] = await database.sql<{ count: string }[]>`
+        SELECT count(*)::text AS "count"
+        FROM "rate_limit"
+        WHERE "key" LIKE 'identity-v1:wallet-challenge:%'
+      `;
+      const invalidRequest = await app.request(
+        "https://identity.test/v1/wallet/challenges",
+        {
+          body: JSON.stringify({
+            chainId: 999,
+            clientId: "attacker-selected-client",
+            walletAddress: rateLimitedWallet.address,
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Origin: "https://attacker.invalid",
+          },
+          method: "POST",
+        },
+      );
+      const [afterInvalidRequest] = await database.sql<{ count: string }[]>`
+        SELECT count(*)::text AS "count"
+        FROM "rate_limit"
+        WHERE "key" LIKE 'identity-v1:wallet-challenge:%'
+      `;
+      expect(invalidRequest.status).toBe(404);
+      expect(afterInvalidRequest?.count).toBe(beforeInvalidRequest?.count);
+
+      const key = `identity-v1:wallet-challenge:pledge-cash:${origin}`;
       await database.db
         .insert(rateLimit)
         .values({
@@ -397,10 +444,13 @@ if (databaseUrl === undefined) {
           method: "POST",
         });
 
-      expect((await requestChallenge(rateLimitedWallet.address)).status).toBe(
-        429,
+      const firstResponse = await requestChallenge(rateLimitedWallet.address);
+      const rotatedAddressResponse = await requestChallenge(
+        hostedWallet.address,
       );
-      expect((await requestChallenge(hostedWallet.address)).status).toBe(201);
+      await database.db.delete(rateLimit).where(eq(rateLimit.key, key));
+      expect(firstResponse.status).toBe(429);
+      expect(rotatedAddressResponse.status).toBe(429);
     });
 
     test("links a wallet, exchanges its one-time grant, and preserves one global owner", async () => {
@@ -410,6 +460,7 @@ if (databaseUrl === undefined) {
           body: JSON.stringify({
             chainId: 999,
             clientId: "pledge-cash",
+            purpose: "link",
             walletAddress: wallet.address,
           }),
           headers: {
@@ -423,7 +474,7 @@ if (databaseUrl === undefined) {
       const challenge = WalletChallengeResponseSchema.parse(
         await challengeResponse.json(),
       );
-      expect(challenge.statement).toBe("Sign in to PledgeCash.");
+      expect(challenge.statement).toBe("Link this wallet to PledgeCash.");
       const signature = await wallet.signMessage({
         message: challenge.message,
       });
@@ -555,6 +606,121 @@ if (databaseUrl === undefined) {
         },
       );
       expect(disabledIssueResponse.status).toBe(403);
+    });
+
+    test("keeps ambient sign-in separate and requires an explicit authenticated link", async () => {
+      const ambientSignInWallet = privateKeyToAccount(
+        "0x2222222222222222222222222222222222222222222222222222222222222222",
+      );
+      const explicitLinkWallet = privateKeyToAccount(
+        "0x3333333333333333333333333333333333333333333333333333333333333333",
+      );
+      const handoffResponse = await app.request(
+        "https://identity.test/v1/social-link-handoffs",
+        {
+          body: JSON.stringify({
+            callbackUrl: `${origin}/settings/wallets`,
+            clientId: "pledge-cash",
+            provider: "github",
+            subject,
+          }),
+          headers: {
+            Authorization: basic("pledge-cash", appSecret),
+            "Content-Type": "application/json",
+          },
+          method: "POST",
+        },
+      );
+      const handoff = (await handoffResponse.json()) as { url: string };
+      const sessionResponse = await app.request(handoff.url);
+      const identityCookie = responseCookie(
+        sessionResponse,
+        "peezy-identity.session_token",
+      );
+
+      const challenge = async (
+        purpose: "link" | "sign-in",
+        address: string,
+      ) => {
+        const response = await app.request(
+          "https://identity.test/v1/wallet/challenges",
+          {
+            body: JSON.stringify({
+              chainId: 999,
+              clientId: "pledge-cash",
+              purpose,
+              walletAddress: address,
+            }),
+            headers: {
+              "Content-Type": "application/json",
+              Origin: origin,
+            },
+            method: "POST",
+          },
+        );
+        expect(response.status).toBe(201);
+        return WalletChallengeResponseSchema.parse(await response.json());
+      };
+      const grant = async (
+        walletChallenge: Awaited<ReturnType<typeof challenge>>,
+        signer: typeof ambientSignInWallet,
+        cookie?: string,
+      ) =>
+        await app.request("https://identity.test/v1/wallet/grants", {
+          body: JSON.stringify({
+            clientId: "pledge-cash",
+            message: walletChallenge.message,
+            signature: await signer.signMessage({
+              message: walletChallenge.message,
+            }),
+          }),
+          headers: {
+            ...(cookie === undefined ? {} : { Cookie: cookie }),
+            "Content-Type": "application/json",
+            Origin: origin,
+          },
+          method: "POST",
+        });
+
+      const signInChallenge = await challenge(
+        "sign-in",
+        ambientSignInWallet.address,
+      );
+      expect(signInChallenge.statement).toBe("Sign in to PledgeCash.");
+      const signInResponse = await grant(
+        signInChallenge,
+        ambientSignInWallet,
+        identityCookie,
+      );
+      expect(signInResponse.status).toBe(201);
+      const signedIn = WalletGrantResponseSchema.parse(
+        await signInResponse.json(),
+      );
+      expect(signedIn.user.id).not.toBe(subject);
+      expect(
+        (await identityMe(database.db, subject)).credentials.some(
+          (credential) =>
+            credential.kind === "wallet" &&
+            credential.address === ambientSignInWallet.address.toLowerCase(),
+        ),
+      ).toBe(false);
+
+      const linkChallenge = await challenge("link", explicitLinkWallet.address);
+      expect(linkChallenge.statement).toBe("Link this wallet to PledgeCash.");
+      const unauthenticatedLink = await grant(
+        linkChallenge,
+        explicitLinkWallet,
+      );
+      expect(unauthenticatedLink.status).toBe(401);
+      const linkedResponse = await grant(
+        linkChallenge,
+        explicitLinkWallet,
+        identityCookie,
+      );
+      expect(linkedResponse.status).toBe(201);
+      expect(
+        WalletGrantResponseSchema.parse(await linkedResponse.json()).user.id,
+      ).toBe(subject);
     });
 
     test("hands an authenticated application subject into an explicit social-link flow once", async () => {
@@ -909,6 +1075,28 @@ async function exchangeAuthorizationCode(input: {
         grant_type: "authorization_code",
         redirect_uri: "https://pledge.test/auth/callback/peezy",
         resource: input.resource,
+      }),
+      headers: {
+        Authorization: basic("pledge-cash", input.oidcSecret),
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      method: "POST",
+    },
+  );
+}
+
+async function refreshAccessToken(input: {
+  app: ReturnType<typeof createIdentityApp>;
+  oidcSecret: string;
+  refreshToken: string;
+}): Promise<Response> {
+  return await input.app.request(
+    "https://identity.test/api/auth/oauth2/token",
+    {
+      body: new URLSearchParams({
+        client_id: "pledge-cash",
+        grant_type: "refresh_token",
+        refresh_token: input.refreshToken,
       }),
       headers: {
         Authorization: basic("pledge-cash", input.oidcSecret),

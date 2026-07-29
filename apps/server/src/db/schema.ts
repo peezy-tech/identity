@@ -251,6 +251,7 @@ export const walletChallenge = pgTable(
     domain: text("domain").notNull(),
     uri: text("uri").notNull(),
     statement: text("statement").notNull(),
+    purpose: text("purpose").default("sign-in").notNull(),
     issuedAt: timestamp("issued_at").notNull(),
     expiresAt: timestamp("expires_at").notNull(),
     usedAt: timestamp("used_at"),
@@ -260,6 +261,10 @@ export const walletChallenge = pgTable(
     index("wallet_challenge_client_idx").on(table.clientId, table.createdAt),
     index("wallet_challenge_expiry_idx").on(table.expiresAt),
     check("wallet_challenge_chain_check", sql`${table.chainId} > 0`),
+    check(
+      "wallet_challenge_purpose_check",
+      sql`${table.purpose} IN ('link', 'sign-in')`,
+    ),
   ],
 );
 

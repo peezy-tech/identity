@@ -253,10 +253,9 @@ export async function assertDistinctDatabases(
     readDatabaseIdentity(target),
   ]);
   if (
-    sourceIdentity.database === targetIdentity.database &&
-    sourceIdentity.serverAddress === targetIdentity.serverAddress &&
-    sourceIdentity.serverPort === targetIdentity.serverPort &&
-    sourceIdentity.postmasterStartedAt === targetIdentity.postmasterStartedAt
+    sourceIdentity.postmasterStartedAtEpoch ===
+      targetIdentity.postmasterStartedAtEpoch &&
+    sourceIdentity.databaseOid === targetIdentity.databaseOid
   ) {
     throw new Error(
       "PLEDGE_DATABASE_URL and DATABASE_URL resolve to the same database",
@@ -417,24 +416,20 @@ export async function importIdentity(
 }
 
 async function readDatabaseIdentity(sql: postgres.Sql): Promise<{
-  database: string;
-  postmasterStartedAt: string;
-  serverAddress: string | null;
-  serverPort: number | null;
+  databaseOid: string;
+  postmasterStartedAtEpoch: string;
 }> {
   const [identity] = await sql<
     {
-      database: string;
-      postmasterStartedAt: string;
-      serverAddress: string | null;
-      serverPort: number | null;
+      databaseOid: string;
+      postmasterStartedAtEpoch: string;
     }[]
   >`
     SELECT
-      current_database() AS "database",
-      pg_postmaster_start_time()::text AS "postmasterStartedAt",
-      inet_server_addr()::text AS "serverAddress",
-      inet_server_port() AS "serverPort"
+      (SELECT oid::text FROM pg_database WHERE datname = current_database())
+        AS "databaseOid",
+      extract(epoch FROM pg_postmaster_start_time())::text
+        AS "postmasterStartedAtEpoch"
   `;
   if (identity === undefined) {
     throw new Error("Database identity could not be read");
