@@ -20,10 +20,18 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@peezy.tech/identity": "0.1.0",
     "jose": "6.2.4"
   },
+  "peerDependencies": {
+    "@peezy.tech/identity": "0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@peezy.tech/identity": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@peezy.tech/identity": "workspace:*",
     "typescript": "5.9.3"
   },
   "publishConfig": {

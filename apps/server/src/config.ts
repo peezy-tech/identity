@@ -111,6 +111,19 @@ export function loadConfig(
   env: Record<string, string | undefined> = process.env,
 ): IdentityConfig {
   const parsed = envSchema.parse(env);
+  for (const appClient of parsed.IDENTITY_APP_CLIENTS) {
+    const oidcClient = parsed.IDENTITY_OIDC_CLIENTS.find(
+      (client) => client.clientId === appClient.id,
+    );
+    if (
+      oidcClient !== undefined &&
+      oidcClient.clientSecret === appClient.secret
+    ) {
+      throw new Error(
+        `Application ${appClient.id} must use distinct app API and OIDC client secrets`,
+      );
+    }
+  }
   const socialProviders: IdentityConfig["socialProviders"] = {};
 
   addSocialProvider(

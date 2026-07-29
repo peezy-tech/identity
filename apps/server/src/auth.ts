@@ -3,7 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { betterAuth } from "better-auth";
-import { genericOAuth, jwt, organization, siwe } from "better-auth/plugins";
+import { genericOAuth, jwt, siwe } from "better-auth/plugins";
 import { and, eq, sql } from "drizzle-orm";
 import {
   createRemoteJWKSet,
@@ -160,10 +160,6 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
             message,
             signature,
           }),
-      }),
-      organization({
-        allowUserToCreateOrganization: false,
-        requireEmailVerificationOnInvitation: true,
       }),
       sessionHandoffPlugin(db, config),
       oauthProvider({

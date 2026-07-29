@@ -36,39 +36,8 @@ type LegacyWalletOwner = {
   userId: string;
 };
 
-type LegacyOrganization = {
-  createdAt: Date;
-  id: string;
-  logo: string | null;
-  metadata: string | null;
-  name: string;
-  slug: string;
-};
-
-type LegacyMember = {
-  createdAt: Date;
-  id: string;
-  organizationId: string;
-  role: string;
-  userId: string;
-};
-
-type LegacyInvitation = {
-  createdAt: Date;
-  email: string;
-  expiresAt: Date;
-  id: string;
-  inviterId: string;
-  organizationId: string;
-  role: string | null;
-  status: string;
-};
-
 export type ImportData = {
   accounts: LegacyAccount[];
-  invitations: LegacyInvitation[];
-  members: LegacyMember[];
-  organizations: LegacyOrganization[];
   users: LegacyUser[];
   walletOwners: LegacyWalletOwner[];
   wallets: LegacyWallet[];
@@ -110,9 +79,6 @@ export async function main(
       mode: apply ? "apply" : "dry-run",
       source: {
         accounts: data.accounts.length,
-        invitations: data.invitations.length,
-        members: data.members.length,
-        organizations: data.organizations.length,
         users: data.users.length,
         walletOwners: data.walletOwners.length,
         wallets: data.wallets.length,
@@ -130,7 +96,7 @@ export async function main(
       console.log(
         `${apply ? "Imported and verified" : "Validated"} ${data.users.length} users, ` +
           `${data.walletOwners.length} EOA principals, ${data.accounts.length} provider accounts, ` +
-          `and ${data.organizations.length} organizations.`,
+          `and ${data.wallets.length} wallet observations.`,
       );
       if (!apply) {
         console.log(
@@ -150,15 +116,7 @@ if (import.meta.main) {
 export async function readLegacyIdentity(
   sql: postgres.Sql,
 ): Promise<ImportData> {
-  const [
-    users,
-    accounts,
-    wallets,
-    walletOwners,
-    organizations,
-    members,
-    invitations,
-  ] = await Promise.all([
+  const [users, accounts, wallets, walletOwners] = await Promise.all([
     sql<LegacyUser[]>`
       SELECT
         "id"::text AS "id",
@@ -201,47 +159,10 @@ export async function readLegacyIdentity(
       FROM "wallet_owners"
       ORDER BY lower("address")
     `,
-    sql<LegacyOrganization[]>`
-      SELECT
-        "id"::text AS "id",
-        "name",
-        "slug",
-        "logo",
-        "metadata",
-        "created_at" AS "createdAt"
-      FROM "organizations"
-      ORDER BY "id"
-    `,
-    sql<LegacyMember[]>`
-      SELECT
-        "id"::text AS "id",
-        "organization_id"::text AS "organizationId",
-        "user_id"::text AS "userId",
-        "role",
-        "created_at" AS "createdAt"
-      FROM "organization_members"
-      ORDER BY "id"
-    `,
-    sql<LegacyInvitation[]>`
-      SELECT
-        "id"::text AS "id",
-        "organization_id"::text AS "organizationId",
-        "email",
-        "role",
-        "status",
-        "expires_at" AS "expiresAt",
-        "created_at" AS "createdAt",
-        "inviter_id"::text AS "inviterId"
-      FROM "organization_invitations"
-      ORDER BY "id"
-    `,
   ]);
 
   return {
     accounts: [...accounts],
-    invitations: [...invitations],
-    members: [...members],
-    organizations: [...organizations],
     users: [...users],
     walletOwners: [...walletOwners],
     wallets: [...wallets],
@@ -256,35 +177,8 @@ export function validateLegacyIdentity(data: ImportData): void {
     (row) => `${row.providerId}\0${row.accountId}`,
     "provider account",
   );
-  const organizationIds = uniqueMap(
-    data.organizations,
-    (row) => row.id,
-    "organization id",
-  );
-  uniqueMap(data.organizations, (row) => row.slug, "organization slug");
-
   for (const account of data.accounts) {
     requireReference(userIds, account.userId, `account ${account.id}`);
-  }
-  for (const member of data.members) {
-    requireReference(userIds, member.userId, `member ${member.id}`);
-    requireReference(
-      organizationIds,
-      member.organizationId,
-      `member ${member.id}`,
-    );
-  }
-  for (const invitation of data.invitations) {
-    requireReference(
-      userIds,
-      invitation.inviterId,
-      `invitation ${invitation.id}`,
-    );
-    requireReference(
-      organizationIds,
-      invitation.organizationId,
-      `invitation ${invitation.id}`,
-    );
   }
 
   const owners = uniqueMap(
@@ -390,29 +284,6 @@ export async function importIdentity(
         ON CONFLICT ("id") DO NOTHING
       `;
       }
-      if (data.organizations.length > 0) {
-        stage = "organizations";
-        const rows = data.organizations.map((row) => ({
-          created_at: row.createdAt.toISOString(),
-          id: row.id,
-          logo: row.logo,
-          metadata: row.metadata,
-          name: row.name,
-          slug: row.slug,
-        }));
-        await transaction`
-        INSERT INTO "organization" ${transaction(
-          rows,
-          "id",
-          "name",
-          "slug",
-          "logo",
-          "created_at",
-          "metadata",
-        )}
-        ON CONFLICT ("id") DO NOTHING
-      `;
-      }
       if (data.walletOwners.length > 0) {
         stage = "wallet principals";
         const rows = data.walletOwners.map((owner) => {
@@ -493,54 +364,6 @@ export async function importIdentity(
           "user_id",
           "created_at",
           "updated_at",
-        )}
-        ON CONFLICT ("id") DO NOTHING
-      `;
-      }
-      if (data.members.length > 0) {
-        stage = "organization members";
-        const rows = data.members.map((row) => ({
-          created_at: row.createdAt.toISOString(),
-          id: row.id,
-          organization_id: row.organizationId,
-          role: row.role,
-          user_id: row.userId,
-        }));
-        await transaction`
-        INSERT INTO "member" ${transaction(
-          rows,
-          "id",
-          "organization_id",
-          "user_id",
-          "role",
-          "created_at",
-        )}
-        ON CONFLICT ("id") DO NOTHING
-      `;
-      }
-      if (data.invitations.length > 0) {
-        stage = "organization invitations";
-        const rows = data.invitations.map((row) => ({
-          created_at: row.createdAt.toISOString(),
-          email: row.email,
-          expires_at: row.expiresAt.toISOString(),
-          id: row.id,
-          inviter_id: row.inviterId,
-          organization_id: row.organizationId,
-          role: row.role,
-          status: row.status,
-        }));
-        await transaction`
-        INSERT INTO "invitation" ${transaction(
-          rows,
-          "id",
-          "organization_id",
-          "email",
-          "role",
-          "status",
-          "expires_at",
-          "created_at",
-          "inviter_id",
         )}
         ON CONFLICT ("id") DO NOTHING
       `;
@@ -649,17 +472,6 @@ export async function verifyImport(
     }
   }
 
-  await verifyIdMappings(sql, "organization", data.organizations, [
-    ["slug", (row) => row.slug],
-  ]);
-  await verifyIdMappings(sql, "member", data.members, [
-    ["organization_id", (row) => row.organizationId],
-    ["user_id", (row) => row.userId],
-  ]);
-  await verifyIdMappings(sql, "invitation", data.invitations, [
-    ["organization_id", (row) => row.organizationId],
-    ["inviter_id", (row) => row.inviterId],
-  ]);
   await verifyIdMappings(sql, "wallet_address", data.wallets, [
     ["user_id", (row) => row.userId],
     ["chain_id", (row) => String(row.chainId)],
@@ -668,7 +480,7 @@ export async function verifyImport(
 
 async function verifyIdMappings<T extends { id: string }>(
   sql: postgres.Sql,
-  table: "invitation" | "member" | "organization" | "wallet_address",
+  table: "wallet_address",
   source: T[],
   fields: Array<[string, (row: T) => string]>,
 ): Promise<void> {

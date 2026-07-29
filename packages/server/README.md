@@ -3,6 +3,9 @@
 Server-side helpers for integrating a confidential peezy.tech application with
 the shared identity provider.
 
+Install this package together with `@peezy.tech/identity`; the server helpers
+consume the shared runtime schemas as well as their TypeScript types.
+
 The package verifies audience-bound access tokens through the provider JWKS and
 supports the one-time wallet-grant and social-link handoff flows. Keep the
 application client secret on the server.

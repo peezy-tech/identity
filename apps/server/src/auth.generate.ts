@@ -1,6 +1,6 @@
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { betterAuth } from "better-auth";
-import { jwt, organization, siwe } from "better-auth/plugins";
+import { jwt, siwe } from "better-auth/plugins";
 import { randomBytes } from "node:crypto";
 import { verifyMessage } from "viem";
 
@@ -23,10 +23,6 @@ export const auth = betterAuth({
           message,
           signature: signature as `0x${string}`,
         }),
-    }),
-    organization({
-      allowUserToCreateOrganization: false,
-      requireEmailVerificationOnInvitation: true,
     }),
     oauthProvider({
       consentPage: "/consent",

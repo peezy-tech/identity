@@ -27,7 +27,6 @@ Canonicalize in peezy.tech Identity:
 - `auth_accounts`
 - `auth_wallets`
 - `wallet_owners`
-- shared `organizations`, members, and invitations
 
 Existing PledgeCash sessions and transient verification rows are deliberately
 not copied. The compatibility adapter continues to validate already-issued
@@ -36,6 +35,7 @@ Identity.
 
 Keep in PledgeCash:
 
+- organizations, memberships, invitations, and product roles;
 - alert-wallet coverage, renamed so it cannot be confused with credentials;
 - wallet-link compatibility nonces until the old route is retired;
 - notification channels and Telegram link codes;
@@ -64,8 +64,8 @@ as a cross-database foreign key.
    bun --cwd apps/server import:pledge-cash --apply
    ```
 
-2. Compare row counts, provider-subject uniqueness, normalized wallet ownership,
-   organization membership, and the importer's source-to-target ID mappings.
+2. Compare row counts, provider-subject uniqueness, normalized wallet
+   ownership, and the importer's source-to-target ID mappings.
 3. Deploy the provider and configure the PledgeCash compatibility adapter.
 4. Switch credential writes to Identity exactly once.
 5. Continue accepting legacy PledgeCash sessions until their original expiry,

@@ -20,13 +20,13 @@ The identity provider owns:
 - social and wallet credentials, plus verified email attributes;
 - explicit credential linking and collision prevention;
 - identity sessions, OAuth grants, refresh-token rotation, and revocation;
-- shared human organizations and membership;
 - security audit events;
 - registered OAuth clients and their exact redirect origins.
 
 Each product owns:
 
 - product roles, preferences, subscriptions, and entitlements;
+- product organizations, memberships, invitations, and role assignments;
 - product delivery channels and operational data;
 - transaction construction and signing;
 - authorization that depends on current chain state;
@@ -42,8 +42,8 @@ application integration. Access tokens are audience-bound and verified through
 the issuer's JWKS.
 
 Tokens stay small and contain only stable or short-lived claims. Linked wallets,
-social providers, email addresses, and organization membership are fetched from
-the identity API when current state is required.
+social providers, and email attributes are fetched from the identity API when
+current state is required.
 
 The provider also supports a confidential, one-time wallet grant:
 

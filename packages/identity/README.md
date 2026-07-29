@@ -8,10 +8,9 @@ import { createIdentityClient } from "@peezy.tech/identity";
 
 const identity = createIdentityClient({
   baseUrl: "https://identity.peezy.tech",
-  clientId: "my-app",
 });
 
-const capabilities = await identity.getCapabilities();
+const capabilities = await identity.capabilities();
 ```
 
 The stable `PeezyUser` subject does not require a wallet. Social accounts,

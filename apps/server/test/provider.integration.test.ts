@@ -289,7 +289,7 @@ if (databaseUrl === undefined) {
       expect((await app.request(handoff.url)).status).toBe(401);
     });
 
-    test("imports and verifies the legacy PledgeCash identity rows without sessions or provider tokens", async () => {
+    test("imports identity rows without sessions, provider tokens, or product organizations", async () => {
       await database.sql.unsafe("DROP SCHEMA IF EXISTS legacy_pledge CASCADE");
       await database.sql.unsafe("CREATE SCHEMA legacy_pledge");
       await database.sql.unsafe(`
@@ -445,6 +445,12 @@ if (databaseUrl === undefined) {
             }),
           ]),
         );
+        const [copiedOrganization] = await database.sql<{ count: string }[]>`
+          SELECT count(*)::text AS "count"
+          FROM "organization"
+          WHERE "id" = ${organizationId}
+        `;
+        expect(copiedOrganization?.count).toBe("0");
       } finally {
         await legacy.end({ timeout: 5 });
       }
