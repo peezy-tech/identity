@@ -37,6 +37,7 @@ bun install --frozen-lockfile
 bun run typecheck
 bun run test
 bun run build
+bun run package:smoke
 bun run format:check
 ```
 

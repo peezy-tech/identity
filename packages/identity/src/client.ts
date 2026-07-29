@@ -8,7 +8,7 @@ import {
   type WalletChallengeRequest,
   type WalletGrantRequest,
   type WalletGrantResponse,
-} from "./contracts";
+} from "./contracts.js";
 
 export type IdentityFetch = (
   input: RequestInfo | URL,
