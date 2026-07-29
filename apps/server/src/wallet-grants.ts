@@ -201,11 +201,17 @@ export async function createWalletGrant(input: {
       "SIWE message does not match its challenge",
     );
   }
-  const signatureValid = await verifyMessage({
-    address: getAddress(challenge.address),
-    message: input.message,
-    signature: input.signature as Hex,
-  });
+  let signatureValid = false;
+  try {
+    signatureValid = await verifyMessage({
+      address: getAddress(challenge.address),
+      message: input.message,
+      signature: input.signature as Hex,
+    });
+  } catch {
+    // viem throws for structurally malformed signatures instead of returning
+    // false. Treat both outcomes as failed authentication.
+  }
   if (!signatureValid) {
     throw new WalletGrantError(401, "SIWE signature is invalid");
   }
@@ -264,7 +270,7 @@ export async function createWalletGrant(input: {
       );
     }
     if (
-      input.sessionSubject === undefined &&
+      challenge.purpose === "sign-in" &&
       existingPrincipal !== undefined &&
       !existingPrincipal.signInEnabled
     ) {

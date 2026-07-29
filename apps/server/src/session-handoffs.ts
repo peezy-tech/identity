@@ -4,6 +4,7 @@ import type {
   SocialLinkHandoffResponse,
   SocialProvider,
 } from "@peezy.tech/identity";
+import type { Session } from "better-auth";
 import { APIError, createAuthEndpoint } from "better-auth/api";
 import { setSessionCookie } from "better-auth/cookies";
 import { and, eq, gt, isNull, lt } from "drizzle-orm";
@@ -20,6 +21,69 @@ import {
 import { WalletGrantError } from "./wallet-grants";
 
 export const SESSION_HANDOFF_TTL_MS = 2 * 60 * 1_000;
+
+export async function consumeSessionHandoff(input: {
+  createSession: (userId: string) => Promise<Session | null>;
+  db: IdentityDb;
+  deleteSession: (token: string) => Promise<void>;
+  now?: Date;
+  token: string;
+}) {
+  const now = input.now ?? new Date();
+  const [handoff] = await input.db
+    .select()
+    .from(sessionHandoff)
+    .where(
+      and(
+        eq(sessionHandoff.tokenHash, opaqueHash(input.token)),
+        isNull(sessionHandoff.consumedAt),
+        gt(sessionHandoff.expiresAt, now),
+      ),
+    )
+    .limit(1);
+  if (handoff === undefined) {
+    throw invalidSessionHandoff();
+  }
+  const [identityUser] = await input.db
+    .select()
+    .from(user)
+    .where(eq(user.id, handoff.userId))
+    .limit(1);
+  if (identityUser === undefined || identityUser.status !== "active") {
+    throw invalidSessionHandoff();
+  }
+
+  const session = await input.createSession(identityUser.id);
+  if (session === null) {
+    throw new APIError("INTERNAL_SERVER_ERROR", {
+      message: "Identity session could not be created",
+    });
+  }
+
+  let consumed: typeof handoff | undefined;
+  try {
+    [consumed] = await input.db
+      .update(sessionHandoff)
+      .set({ consumedAt: now })
+      .where(
+        and(
+          eq(sessionHandoff.id, handoff.id),
+          isNull(sessionHandoff.consumedAt),
+          gt(sessionHandoff.expiresAt, now),
+        ),
+      )
+      .returning();
+  } catch (error) {
+    await input.deleteSession(session.token);
+    throw error;
+  }
+  if (consumed === undefined) {
+    await input.deleteSession(session.token);
+    throw invalidSessionHandoff();
+  }
+
+  return { handoff: consumed, session, user: identityUser };
+}
 
 export async function createSocialLinkHandoff(input: {
   baseUrl: string;
@@ -103,45 +167,16 @@ export function sessionHandoffPlugin(
           query: z.object({ token: z.string().min(32).max(256) }),
         },
         async (context) => {
-          const now = new Date();
-          const handoff = await db.transaction(async (transaction) => {
-            const [consumed] = await transaction
-              .update(sessionHandoff)
-              .set({ consumedAt: now })
-              .where(
-                and(
-                  eq(sessionHandoff.tokenHash, opaqueHash(context.query.token)),
-                  isNull(sessionHandoff.consumedAt),
-                  gt(sessionHandoff.expiresAt, now),
-                ),
-              )
-              .returning();
-            if (consumed === undefined) return null;
-            const [identityUser] = await transaction
-              .select()
-              .from(user)
-              .where(eq(user.id, consumed.userId))
-              .limit(1);
-            return identityUser === undefined
-              ? null
-              : { handoff: consumed, user: identityUser };
+          const handoff = await consumeSessionHandoff({
+            createSession: (userId) =>
+              context.context.internalAdapter.createSession(userId),
+            db,
+            deleteSession: (token) =>
+              context.context.internalAdapter.deleteSession(token),
+            token: context.query.token,
           });
-          if (handoff === null || handoff.user.status !== "active") {
-            throw new APIError("UNAUTHORIZED", {
-              message: "Session handoff is invalid or expired",
-            });
-          }
-
-          const session = await context.context.internalAdapter.createSession(
-            handoff.user.id,
-          );
-          if (session === null) {
-            throw new APIError("INTERNAL_SERVER_ERROR", {
-              message: "Identity session could not be created",
-            });
-          }
           await setSessionCookie(context, {
-            session,
+            session: handoff.session,
             user: handoff.user,
           });
 
@@ -158,4 +193,10 @@ export function sessionHandoffPlugin(
 
 function opaqueHash(value: string): string {
   return createHash("sha256").update(value).digest("base64url");
+}
+
+function invalidSessionHandoff(): APIError {
+  return new APIError("UNAUTHORIZED", {
+    message: "Session handoff is invalid or expired",
+  });
 }

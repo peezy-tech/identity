@@ -106,14 +106,18 @@ export const verification = pgTable(
   (table) => [index("verification_identifier_idx").on(table.identifier)],
 );
 
-export const rateLimit = pgTable("rate_limit", {
-  id: text("id")
-    .primaryKey()
-    .default(sql`gen_random_uuid()::text`),
-  key: text("key").notNull().unique(),
-  count: integer("count").notNull(),
-  lastRequest: bigint("last_request", { mode: "number" }).notNull(),
-});
+export const rateLimit = pgTable(
+  "rate_limit",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    key: text("key").notNull().unique(),
+    count: integer("count").notNull(),
+    lastRequest: bigint("last_request", { mode: "number" }).notNull(),
+  },
+  (table) => [index("rate_limit_last_request_idx").on(table.lastRequest)],
+);
 
 export const jwks = pgTable("jwks", {
   id: text("id")

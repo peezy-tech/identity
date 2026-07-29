@@ -30,6 +30,8 @@ import { HOSTED_WALLET_STATEMENT } from "../src/constants";
 import { createDbClient, type IdentityDbClient } from "../src/db/client";
 import { rateLimit, user, walletAddress } from "../src/db/schema";
 import { identityMe } from "../src/identity";
+import { MAX_RATE_LIMIT_WINDOW_MS, consumeRateLimit } from "../src/rate-limit";
+import { consumeSessionHandoff } from "../src/session-handoffs";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -469,6 +471,41 @@ if (databaseUrl === undefined) {
       expect(rotatedIpResponse.status).toBe(201);
     });
 
+    test("removes expired rate-limit keys while consuming a new key", async () => {
+      const prefix = `rate-limit-cleanup:${randomBytes(8).toString("hex")}`;
+      const now = Date.now();
+      await database.db.insert(rateLimit).values([
+        {
+          count: 1,
+          key: `identity-v1:${prefix}:stale-a`,
+          lastRequest: now - MAX_RATE_LIMIT_WINDOW_MS - 1,
+        },
+        {
+          count: 1,
+          key: `identity-v1:${prefix}:stale-b`,
+          lastRequest: now - MAX_RATE_LIMIT_WINDOW_MS - 1,
+        },
+      ]);
+
+      expect(
+        await consumeRateLimit({
+          db: database.db,
+          key: `${prefix}:fresh`,
+          limit: 1,
+          now,
+          windowMs: MAX_RATE_LIMIT_WINDOW_MS,
+        }),
+      ).toBe(true);
+
+      const [remaining] = await database.sql<{ count: string }[]>`
+        SELECT count(*)::text AS "count"
+        FROM "rate_limit"
+        WHERE "key" LIKE ${`identity-v1:${prefix}:%`}
+          AND "last_request" < ${now - MAX_RATE_LIMIT_WINDOW_MS}
+      `;
+      expect(remaining?.count).toBe("0");
+    });
+
     test("rate limits wallet grants only after challenge validation", async () => {
       const grantWallet = privateKeyToAccount(
         "0x4444444444444444444444444444444444444444444444444444444444444444",
@@ -560,6 +597,54 @@ if (databaseUrl === undefined) {
       expect((await requestGrant(limitedIp)).status).toBe(429);
       expect((await requestGrant(otherIp)).status).toBe(201);
       await database.db.delete(rateLimit).where(eq(rateLimit.key, key));
+    });
+
+    test("rejects malformed wallet signatures without consuming the challenge", async () => {
+      const malformedSignatureWallet = privateKeyToAccount(
+        "0x5555555555555555555555555555555555555555555555555555555555555555",
+      );
+      const challengeResponse = await app.request(
+        "https://identity.test/v1/wallet/challenges",
+        {
+          body: JSON.stringify({
+            chainId: 999,
+            clientId: "pledge-cash",
+            walletAddress: malformedSignatureWallet.address,
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Origin: origin,
+          },
+          method: "POST",
+        },
+      );
+      const challenge = WalletChallengeResponseSchema.parse(
+        await challengeResponse.json(),
+      );
+      const requestGrant = (signature: string) =>
+        app.request("https://identity.test/v1/wallet/grants", {
+          body: JSON.stringify({
+            clientId: "pledge-cash",
+            message: challenge.message,
+            signature,
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Origin: origin,
+          },
+          method: "POST",
+        });
+
+      expect((await requestGrant("0x00")).status).toBe(401);
+      expect(
+        (
+          await requestGrant(
+            await malformedSignatureWallet.signMessage({
+              message: challenge.message,
+            }),
+          )
+        ).status,
+      ).toBe(201);
     });
 
     test("links a wallet, exchanges its one-time grant, and preserves one global owner", async () => {
@@ -706,6 +791,7 @@ if (databaseUrl === undefined) {
             signature: await wallet.signMessage({
               message: disabledChallenge.message,
             }),
+            subject,
           }),
           headers: {
             Authorization: basic("pledge-cash", appSecret),
@@ -814,6 +900,25 @@ if (databaseUrl === undefined) {
         ),
       ).toBe(false);
 
+      await database.sql`
+        UPDATE "wallet_principal"
+        SET "sign_in_enabled" = false
+        WHERE lower("address") = ${ambientSignInWallet.address.toLowerCase()}
+      `;
+      const disabledSignInChallenge = await challenge(
+        "sign-in",
+        ambientSignInWallet.address,
+      );
+      expect(
+        (
+          await grant(
+            disabledSignInChallenge,
+            ambientSignInWallet,
+            identityCookie,
+          )
+        ).status,
+      ).toBe(403);
+
       const linkChallenge = await challenge("link", explicitLinkWallet.address);
       expect(linkChallenge.statement).toBe("Link this wallet to PledgeCash.");
       const unauthenticatedLink = await grant(
@@ -862,6 +967,27 @@ if (databaseUrl === undefined) {
       );
       expect(handoffResponse.status).toBe(201);
       const handoff = (await handoffResponse.json()) as { url: string };
+      const handoffToken = new URL(handoff.url).searchParams.get("token");
+      if (handoffToken === null)
+        throw new Error("Missing session handoff token");
+      await expect(
+        consumeSessionHandoff({
+          createSession: async () => {
+            throw new Error("transient session creation failure");
+          },
+          db: database.db,
+          deleteSession: async () => undefined,
+          token: handoffToken,
+        }),
+      ).rejects.toThrow("transient session creation failure");
+      await expect(
+        consumeSessionHandoff({
+          createSession: async () => null,
+          db: database.db,
+          deleteSession: async () => undefined,
+          token: handoffToken,
+        }),
+      ).rejects.toMatchObject({ status: "INTERNAL_SERVER_ERROR" });
       const consumeResponse = await app.request(handoff.url);
       expect(consumeResponse.status).toBe(302);
       expect(consumeResponse.headers.get("set-cookie")).toContain(
