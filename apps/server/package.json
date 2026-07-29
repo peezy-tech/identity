@@ -1,0 +1,33 @@
+{
+  "name": "@peezy.tech/identity-provider",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun --packages external",
+    "dev": "bun --watch src/index.ts",
+    "drizzle:generate": "bunx --bun drizzle-kit@0.31.10 generate",
+    "import:pledge-cash": "bun scripts/import-pledge-cash.ts",
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@better-auth/core": "1.7.0-rc.1",
+    "@better-auth/drizzle-adapter": "1.7.0-rc.1",
+    "@better-auth/oauth-provider": "1.7.0-rc.1",
+    "@peezy.tech/identity": "workspace:*",
+    "@peezy.tech/identity-server": "workspace:*",
+    "better-auth": "1.7.0-rc.1",
+    "drizzle-orm": "0.45.2",
+    "hono": "4.12.32",
+    "jose": "6.2.4",
+    "postgres": "3.4.7",
+    "viem": "2.55.8",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "drizzle-kit": "0.31.10",
+    "typescript": "5.9.3"
+  }
+}

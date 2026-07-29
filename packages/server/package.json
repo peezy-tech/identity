@@ -1,0 +1,33 @@
+{
+  "name": "@peezy.tech/identity-server",
+  "version": "0.1.0",
+  "description": "Server helpers for peezy.tech Identity",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && bun build src/index.ts --outdir dist --target node --external jose --sourcemap=external",
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "jose": "6.2.4"
+  },
+  "devDependencies": {
+    "@peezy.tech/identity": "workspace:*",
+    "typescript": "5.9.3"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

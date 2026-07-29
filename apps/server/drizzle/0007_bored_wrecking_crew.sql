@@ -1,0 +1,2 @@
+ALTER TABLE "wallet_challenge" ADD COLUMN "purpose" text DEFAULT 'sign-in' NOT NULL;--> statement-breakpoint
+ALTER TABLE "wallet_challenge" ADD CONSTRAINT "wallet_challenge_purpose_check" CHECK ("wallet_challenge"."purpose" IN ('link', 'sign-in'));

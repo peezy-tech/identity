@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "wallet_address_primary_uidx" ON "wallet_address" USING btree ("user_id") WHERE "wallet_address"."is_primary" = true;
