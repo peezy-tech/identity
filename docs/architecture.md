@@ -38,8 +38,10 @@ database or use cross-service foreign keys.
 ## Protocol
 
 OAuth 2.1 authorization code with PKCE and OpenID Connect are the primary
-application integration. Access tokens are audience-bound and verified through
-the issuer's JWKS.
+application integration. Applications that need a bearer token for an API
+request a registered resource audience; those JWT access tokens are
+audience-bound and verified through the issuer's JWKS. OIDC user-info flows may
+use provider-managed opaque access tokens instead.
 
 Tokens stay small and contain only stable or short-lived claims. Linked wallets,
 social providers, and email attributes are fetched from the identity API when

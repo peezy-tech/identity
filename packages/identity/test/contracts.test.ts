@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   IdentityMeResponseSchema,
+  PeezyUserSchema,
   WalletCredentialSchema,
 } from "../src/contracts";
 
@@ -36,6 +37,15 @@ describe("identity contracts", () => {
       ],
       user,
     });
+  });
+
+  test("accepts only web URLs for public avatars", () => {
+    expect(() =>
+      PeezyUserSchema.parse({
+        ...user,
+        avatarUrl: "javascript:alert(1)",
+      }),
+    ).toThrow("Expected an HTTP or HTTPS URL");
   });
 
   test("normalizes EOA addresses and keeps them chain independent", () => {

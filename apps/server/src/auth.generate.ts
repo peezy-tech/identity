@@ -1,5 +1,5 @@
 import { oauthProvider } from "@better-auth/oauth-provider";
-import { betterAuth } from "better-auth";
+import { betterAuth, type BetterAuthPlugin } from "better-auth";
 import { jwt, siwe } from "better-auth/plugins";
 import { randomBytes } from "node:crypto";
 import { verifyMessage } from "viem";
@@ -28,6 +28,6 @@ export const auth = betterAuth({
       consentPage: "/consent",
       loginPage: "/sign-in",
       scopes: ["openid", "profile", "email", "offline_access"],
-    }),
+    }) as unknown as BetterAuthPlugin,
   ],
 });

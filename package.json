@@ -8,6 +8,10 @@
   "engines": {
     "node": ">=20"
   },
+  "overrides": {
+    "@better-auth/core": "1.7.0-rc.1",
+    "kysely": "0.29.4"
+  },
   "workspaces": [
     "apps/*",
     "packages/*"

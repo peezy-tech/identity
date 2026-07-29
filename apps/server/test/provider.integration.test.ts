@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 
 import {
@@ -9,10 +10,13 @@ import {
 } from "@peezy.tech/identity";
 import { eq } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { decodeJwt } from "jose";
 import postgres from "postgres";
 import { privateKeyToAccount } from "viem/accounts";
+import { createSiweMessage } from "viem/siwe";
 
 import {
+  assertDistinctDatabases,
   importIdentity,
   readLegacyIdentity,
   validateLegacyIdentity,
@@ -22,6 +26,7 @@ import { createIdentityApp } from "../src/app";
 import { createIdentityAuth } from "../src/auth";
 import { seedConfiguredClients } from "../src/clients";
 import type { IdentityConfig } from "../src/config";
+import { HOSTED_WALLET_STATEMENT } from "../src/constants";
 import { createDbClient, type IdentityDbClient } from "../src/db/client";
 import { user, walletAddress } from "../src/db/schema";
 import { identityMe } from "../src/identity";
@@ -42,6 +47,9 @@ if (databaseUrl === undefined) {
     const wallet = privateKeyToAccount(
       "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     );
+    const hostedWallet = privateKeyToAccount(
+      "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+    );
     const config: IdentityConfig = {
       appClients: [
         {
@@ -57,7 +65,7 @@ if (databaseUrl === undefined) {
       databaseUrl,
       oidcClients: [
         {
-          audiences: ["pledge-cash"],
+          audiences: ["https://api.pledge.test", "https://admin.pledge.test"],
           clientId: "pledge-cash",
           clientSecret: oidcSecret,
           name: "PledgeCash",
@@ -72,6 +80,7 @@ if (databaseUrl === undefined) {
           clientSecret: "github-test-secret",
         },
       },
+      trustedProxies: [],
       trustedOrigins: [origin],
     };
 
@@ -134,6 +143,223 @@ if (databaseUrl === undefined) {
       expect(
         identity.credentials.some((credential) => credential.kind === "wallet"),
       ).toBe(false);
+    });
+
+    test("rejects request bodies above the public API limit", async () => {
+      const response = await app.request(
+        "https://identity.test/v1/wallet/challenges",
+        {
+          body: JSON.stringify({ padding: "x".repeat(20_000) }),
+          headers: {
+            "Content-Type": "application/json",
+            Origin: origin,
+          },
+          method: "POST",
+        },
+      );
+      expect(response.status).toBe(413);
+      expect(await response.json()).toEqual({
+        error: { message: "Request body is too large" },
+      });
+
+      const authResponse = await app.request(
+        "https://identity.test/api/auth/siwe/nonce",
+        {
+          body: JSON.stringify({ padding: "x".repeat(100_000) }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      expect(authResponse.status).toBe(413);
+    });
+
+    test("creates one hosted wallet identity and refuses it after disablement", async () => {
+      const chainId = 999;
+      const nonceResponse = await app.request(
+        "https://identity.test/api/auth/siwe/nonce",
+        {
+          body: JSON.stringify({
+            chainId,
+            walletAddress: hostedWallet.address,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      expect(nonceResponse.status).toBe(200);
+      const { nonce } = (await nonceResponse.json()) as { nonce: string };
+      const now = new Date();
+      const message = createSiweMessage({
+        address: hostedWallet.address,
+        chainId,
+        domain: "identity.test",
+        expirationTime: new Date(now.getTime() + 10 * 60 * 1_000),
+        issuedAt: now,
+        nonce,
+        statement: HOSTED_WALLET_STATEMENT,
+        uri: config.baseUrl,
+        version: "1",
+      });
+      const signature = await hostedWallet.signMessage({ message });
+      const verifyResponse = await app.request(
+        "https://identity.test/api/auth/siwe/verify",
+        {
+          body: JSON.stringify({
+            chainId,
+            message,
+            signature,
+            walletAddress: hostedWallet.address,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      expect(verifyResponse.status).toBe(200);
+      expect(verifyResponse.headers.get("set-cookie")).toContain(
+        "peezy-identity.session_token",
+      );
+      const identityCookie = responseCookie(
+        verifyResponse,
+        "peezy-identity.session_token",
+      );
+      const verified = (await verifyResponse.json()) as {
+        user: { id: string };
+      };
+      const hostedIdentity = await identityMe(database.db, verified.user.id);
+      expect(hostedIdentity.credentials).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            address: hostedWallet.address.toLowerCase(),
+            kind: "wallet",
+          }),
+        ]),
+      );
+
+      const challengeResponse = await app.request(
+        "https://identity.test/v1/wallet/challenges",
+        {
+          body: JSON.stringify({
+            chainId,
+            clientId: "pledge-cash",
+            walletAddress: hostedWallet.address,
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Origin: origin,
+          },
+          method: "POST",
+        },
+      );
+      const challenge = WalletChallengeResponseSchema.parse(
+        await challengeResponse.json(),
+      );
+      const appSignature = await hostedWallet.signMessage({
+        message: challenge.message,
+      });
+      const grantResponse = await app.request(
+        "https://identity.test/v1/wallet/grants/issue",
+        {
+          body: JSON.stringify({
+            clientId: "pledge-cash",
+            message: challenge.message,
+            signature: appSignature,
+          }),
+          headers: {
+            Authorization: basic("pledge-cash", appSecret),
+            "Content-Type": "application/json",
+          },
+          method: "POST",
+        },
+      );
+      expect(grantResponse.status).toBe(201);
+      const grant = WalletGrantResponseSchema.parse(await grantResponse.json());
+      expect(grant.user.id).toBe(verified.user.id);
+
+      const authorizedResource = "https://api.pledge.test";
+      const otherResource = "https://admin.pledge.test";
+      const successfulAuthorization = await authorizeCode({
+        app,
+        identityCookie,
+        resource: authorizedResource,
+      });
+      const successfulToken = await exchangeAuthorizationCode({
+        app,
+        code: successfulAuthorization.code,
+        codeVerifier: successfulAuthorization.codeVerifier,
+        oidcSecret,
+        resource: authorizedResource,
+      });
+      expect(successfulToken.status).toBe(200);
+      const tokenBody = (await successfulToken.json()) as {
+        access_token: string;
+      };
+      const audience = decodeJwt(tokenBody.access_token).aud;
+      expect(Array.isArray(audience) ? audience : [audience]).toContain(
+        authorizedResource,
+      );
+
+      const narrowedAuthorization = await authorizeCode({
+        app,
+        identityCookie,
+        resource: authorizedResource,
+      });
+      const widenedToken = await exchangeAuthorizationCode({
+        app,
+        code: narrowedAuthorization.code,
+        codeVerifier: narrowedAuthorization.codeVerifier,
+        oidcSecret,
+        resource: otherResource,
+      });
+      expect(widenedToken.status).toBe(400);
+      expect(await widenedToken.json()).toMatchObject({
+        error: "invalid_target",
+      });
+
+      await database.db
+        .update(user)
+        .set({ status: "disabled" })
+        .where(eq(user.id, verified.user.id));
+      const disabledNonceResponse = await app.request(
+        "https://identity.test/api/auth/siwe/nonce",
+        {
+          body: JSON.stringify({
+            chainId,
+            walletAddress: hostedWallet.address,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      const disabledNonce = (await disabledNonceResponse.json()) as {
+        nonce: string;
+      };
+      const disabledMessage = createSiweMessage({
+        address: hostedWallet.address,
+        chainId,
+        domain: "identity.test",
+        expirationTime: new Date(Date.now() + 10 * 60 * 1_000),
+        issuedAt: new Date(),
+        nonce: disabledNonce.nonce,
+        statement: HOSTED_WALLET_STATEMENT,
+        uri: config.baseUrl,
+        version: "1",
+      });
+      const disabledResponse = await app.request(
+        "https://identity.test/api/auth/siwe/verify",
+        {
+          body: JSON.stringify({
+            chainId,
+            message: disabledMessage,
+            signature: await hostedWallet.signMessage({
+              message: disabledMessage,
+            }),
+            walletAddress: hostedWallet.address,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      expect(disabledResponse.status).toBe(401);
     });
 
     test("links a wallet, exchanges its one-time grant, and preserves one global owner", async () => {
@@ -246,6 +472,48 @@ if (databaseUrl === undefined) {
         .from(user)
         .where(eq(user.id, subject));
       expect(owners).toHaveLength(1);
+
+      await database.sql`
+        UPDATE "wallet_principal"
+        SET "sign_in_enabled" = false
+        WHERE lower("address") = ${wallet.address.toLowerCase()}
+      `;
+      const disabledChallengeResponse = await app.request(
+        "https://identity.test/v1/wallet/challenges",
+        {
+          body: JSON.stringify({
+            chainId: 999,
+            clientId: "pledge-cash",
+            walletAddress: wallet.address,
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Origin: origin,
+          },
+          method: "POST",
+        },
+      );
+      const disabledChallenge = WalletChallengeResponseSchema.parse(
+        await disabledChallengeResponse.json(),
+      );
+      const disabledIssueResponse = await app.request(
+        "https://identity.test/v1/wallet/grants/issue",
+        {
+          body: JSON.stringify({
+            clientId: "pledge-cash",
+            message: disabledChallenge.message,
+            signature: await wallet.signMessage({
+              message: disabledChallenge.message,
+            }),
+          }),
+          headers: {
+            Authorization: basic("pledge-cash", appSecret),
+            "Content-Type": "application/json",
+          },
+          method: "POST",
+        },
+      );
+      expect(disabledIssueResponse.status).toBe(403);
     });
 
     test("hands an authenticated application subject into an explicit social-link flow once", async () => {
@@ -287,6 +555,58 @@ if (databaseUrl === undefined) {
         "/link-social?",
       );
       expect((await app.request(handoff.url)).status).toBe(401);
+    });
+
+    test("rejects a same-database migration and rolls back failed verification", async () => {
+      await expect(
+        assertDistinctDatabases(database.sql, database.sql),
+      ).rejects.toThrow(
+        "PLEDGE_DATABASE_URL and DATABASE_URL resolve to the same database",
+      );
+
+      const now = new Date("2026-07-29T00:00:00.000Z");
+      await expect(
+        importIdentity(database.sql, {
+          accounts: [
+            {
+              accountId: "must-roll-back",
+              createdAt: now,
+              id: "c18e4079-7448-40df-b4bc-a8527dd66424",
+              providerId: "discord",
+              updatedAt: now,
+              userId: subject,
+            },
+          ],
+          users: [
+            {
+              createdAt: now,
+              email: "conflicting@example.com",
+              emailVerified: true,
+              id: subject,
+              image: null,
+              name: "Conflicting User",
+              updatedAt: now,
+            },
+          ],
+          walletOwners: [],
+          wallets: [],
+        }),
+      ).rejects.toThrow(
+        "PledgeCash identity import failed during verification",
+      );
+
+      const [accountCount] = await database.sql<{ count: string }[]>`
+        SELECT count(*)::text AS "count"
+        FROM "account"
+        WHERE "id" = 'c18e4079-7448-40df-b4bc-a8527dd66424'
+      `;
+      const [auditCount] = await database.sql<{ count: string }[]>`
+        SELECT count(*)::text AS "count"
+        FROM "identity_audit_event"
+        WHERE "kind" = 'migration.pledge-cash-imported'
+      `;
+      expect(accountCount?.count).toBe("0");
+      expect(auditCount?.count).toBe("0");
     });
 
     test("imports identity rows without sessions, provider tokens, or product organizations", async () => {
@@ -455,9 +775,128 @@ if (databaseUrl === undefined) {
         await legacy.end({ timeout: 5 });
       }
     });
+
+    test("disables config-managed clients removed from deployment config", async () => {
+      await seedConfiguredClients(database.db, {
+        appClients: [],
+        oidcClients: [],
+      });
+      const [configuredApp] = await database.sql<{ disabled: boolean }[]>`
+        SELECT "disabled"
+        FROM "app_client"
+        WHERE "id" = 'pledge-cash'
+      `;
+      const [configuredOidc] = await database.sql<{ disabled: boolean }[]>`
+        SELECT "disabled"
+        FROM "oauth_client"
+        WHERE "client_id" = 'pledge-cash'
+      `;
+      const [configuredResource] = await database.sql<{ disabled: boolean }[]>`
+        SELECT "disabled"
+        FROM "oauth_resource"
+        WHERE "identifier" = 'https://api.pledge.test'
+      `;
+      const [configuredResourceLinks] = await database.sql<{ count: string }[]>`
+        SELECT count(*)::text AS "count"
+        FROM "oauth_client_resource"
+        WHERE "client_id" = 'pledge-cash'
+      `;
+      expect(configuredApp?.disabled).toBe(true);
+      expect(configuredOidc?.disabled).toBe(true);
+      expect(configuredResource?.disabled).toBe(true);
+      expect(configuredResourceLinks?.count).toBe("0");
+    });
   });
 }
 
 function basic(clientId: string, secret: string): string {
   return `Basic ${Buffer.from(`${clientId}:${secret}`).toString("base64")}`;
+}
+
+async function authorizeCode(input: {
+  app: ReturnType<typeof createIdentityApp>;
+  identityCookie: string;
+  resource: string;
+}): Promise<{ code: string; codeVerifier: string }> {
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256")
+    .update(codeVerifier)
+    .digest("base64url");
+  const authorizationUrl = new URL(
+    "https://identity.test/api/auth/oauth2/authorize",
+  );
+  authorizationUrl.searchParams.set("client_id", "pledge-cash");
+  authorizationUrl.searchParams.set("code_challenge", codeChallenge);
+  authorizationUrl.searchParams.set("code_challenge_method", "S256");
+  authorizationUrl.searchParams.set(
+    "redirect_uri",
+    "https://pledge.test/auth/callback/peezy",
+  );
+  authorizationUrl.searchParams.set("resource", input.resource);
+  authorizationUrl.searchParams.set("response_type", "code");
+  authorizationUrl.searchParams.set(
+    "scope",
+    "openid profile email offline_access",
+  );
+  authorizationUrl.searchParams.set("state", randomBytes(16).toString("hex"));
+
+  const response = await input.app.request(authorizationUrl, {
+    headers: { Cookie: input.identityCookie },
+  });
+  expect(response.status).toBe(302);
+  const location = response.headers.get("location");
+  if (location === null) throw new Error("OIDC authorization did not redirect");
+  const code = new URL(location).searchParams.get("code");
+  if (code === null) throw new Error("OIDC authorization returned no code");
+  return { code, codeVerifier };
+}
+
+async function exchangeAuthorizationCode(input: {
+  app: ReturnType<typeof createIdentityApp>;
+  code: string;
+  codeVerifier: string;
+  oidcSecret: string;
+  resource: string;
+}): Promise<Response> {
+  return await input.app.request(
+    "https://identity.test/api/auth/oauth2/token",
+    {
+      body: new URLSearchParams({
+        client_id: "pledge-cash",
+        code: input.code,
+        code_verifier: input.codeVerifier,
+        grant_type: "authorization_code",
+        redirect_uri: "https://pledge.test/auth/callback/peezy",
+        resource: input.resource,
+      }),
+      headers: {
+        Authorization: basic("pledge-cash", input.oidcSecret),
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      method: "POST",
+    },
+  );
+}
+
+function responseCookie(response: Response, name: string): string {
+  const values =
+    typeof response.headers.getSetCookie === "function"
+      ? response.headers.getSetCookie()
+      : [response.headers.get("set-cookie")].filter(
+          (value): value is string => value !== null,
+        );
+  for (const candidate of values) {
+    const pair = candidate.split(";")[0] ?? "";
+    const separator = pair.indexOf("=");
+    if (separator < 1) continue;
+    const cookieName = pair.slice(0, separator);
+    if (
+      cookieName === name ||
+      cookieName === `__Secure-${name}` ||
+      cookieName === `__Host-${name}`
+    ) {
+      return pair;
+    }
+  }
+  throw new Error(`Expected ${name} cookie`);
 }

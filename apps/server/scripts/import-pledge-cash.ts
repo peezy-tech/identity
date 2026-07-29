@@ -71,6 +71,7 @@ export async function main(
   });
 
   try {
+    await assertDistinctDatabases(source, target);
     const data = await readLegacyIdentity(source);
     validateLegacyIdentity(data);
     await assertTargetSchema(target);
@@ -87,7 +88,6 @@ export async function main(
 
     if (apply) {
       await importIdentity(target, data);
-      await verifyImport(target, data);
     }
 
     if (json) {
@@ -172,6 +172,7 @@ export async function readLegacyIdentity(
 export function validateLegacyIdentity(data: ImportData): void {
   const userIds = uniqueMap(data.users, (row) => row.id, "user id");
   uniqueMap(data.users, (row) => row.email.toLowerCase(), "user email");
+  uniqueMap(data.accounts, (row) => row.id, "provider account id");
   uniqueMap(
     data.accounts,
     (row) => `${row.providerId}\0${row.accountId}`,
@@ -194,6 +195,7 @@ export function validateLegacyIdentity(data: ImportData): void {
     (row) => `${normalizedAddress(row.address)}\0${row.chainId}`,
     "wallet and chain",
   );
+  uniqueMap(data.wallets, (row) => row.id, "wallet id");
   for (const wallet of data.wallets) {
     requireReference(userIds, wallet.userId, `wallet ${wallet.id}`);
     const owner = owners.get(normalizedAddress(wallet.address));
@@ -238,6 +240,26 @@ export async function assertTargetSchema(sql: postgres.Sql): Promise<void> {
   if (result?.identityTable !== "user") {
     throw new Error(
       "Target identity schema is missing; start the provider migrations first",
+    );
+  }
+}
+
+export async function assertDistinctDatabases(
+  source: postgres.Sql,
+  target: postgres.Sql,
+): Promise<void> {
+  const [sourceIdentity, targetIdentity] = await Promise.all([
+    readDatabaseIdentity(source),
+    readDatabaseIdentity(target),
+  ]);
+  if (
+    sourceIdentity.database === targetIdentity.database &&
+    sourceIdentity.serverAddress === targetIdentity.serverAddress &&
+    sourceIdentity.serverPort === targetIdentity.serverPort &&
+    sourceIdentity.postmasterStartedAt === targetIdentity.postmasterStartedAt
+  ) {
+    throw new Error(
+      "PLEDGE_DATABASE_URL and DATABASE_URL resolve to the same database",
     );
   }
 }
@@ -368,6 +390,8 @@ export async function importIdentity(
         ON CONFLICT ("id") DO NOTHING
       `;
       }
+      stage = "verification";
+      await verifyImport(transaction, data);
       stage = "audit event";
       await transaction`
       INSERT INTO "identity_audit_event" (
@@ -392,6 +416,32 @@ export async function importIdentity(
   }
 }
 
+async function readDatabaseIdentity(sql: postgres.Sql): Promise<{
+  database: string;
+  postmasterStartedAt: string;
+  serverAddress: string | null;
+  serverPort: number | null;
+}> {
+  const [identity] = await sql<
+    {
+      database: string;
+      postmasterStartedAt: string;
+      serverAddress: string | null;
+      serverPort: number | null;
+    }[]
+  >`
+    SELECT
+      current_database() AS "database",
+      pg_postmaster_start_time()::text AS "postmasterStartedAt",
+      inet_server_addr()::text AS "serverAddress",
+      inet_server_port() AS "serverPort"
+  `;
+  if (identity === undefined) {
+    throw new Error("Database identity could not be read");
+  }
+  return identity;
+}
+
 export async function verifyImport(
   sql: postgres.Sql,
   data: ImportData,
@@ -400,8 +450,23 @@ export async function verifyImport(
   const importedUsers =
     userIds.length === 0
       ? []
-      : await sql<{ email: string; id: string }[]>`
-          SELECT "id", "email"
+      : await sql<
+          {
+            email: string;
+            emailVerified: boolean;
+            id: string;
+            image: string | null;
+            name: string;
+            status: string;
+          }[]
+        >`
+          SELECT
+            "id",
+            "name",
+            "email",
+            "email_verified" AS "emailVerified",
+            "image",
+            "status"
           FROM "user"
           WHERE "id" = ANY(${userIds}::text[])
         `;
@@ -410,7 +475,11 @@ export async function verifyImport(
     const targetUser = targetUsers.get(sourceUser.id);
     if (
       targetUser === undefined ||
-      targetUser.email.toLowerCase() !== sourceUser.email.toLowerCase()
+      targetUser.name !== sourceUser.name ||
+      targetUser.email.toLowerCase() !== sourceUser.email.toLowerCase() ||
+      targetUser.emailVerified !== sourceUser.emailVerified ||
+      targetUser.image !== sourceUser.image ||
+      targetUser.status !== "active"
     ) {
       throw new Error(`Target user verification failed for ${sourceUser.id}`);
     }
@@ -422,20 +491,36 @@ export async function verifyImport(
   const importedOwners =
     ownerAddresses.length === 0
       ? []
-      : await sql<{ address: string; userId: string }[]>`
-          SELECT lower("address") AS "address", "user_id" AS "userId"
+      : await sql<
+          {
+            address: string;
+            id: string;
+            signInEnabled: boolean;
+            userId: string;
+          }[]
+        >`
+          SELECT
+            "id",
+            lower("address") AS "address",
+            "sign_in_enabled" AS "signInEnabled",
+            "user_id" AS "userId"
           FROM "wallet_principal"
           WHERE "family" = 'evm'
             AND "account_kind" = 'eoa'
             AND lower("address") = ANY(${ownerAddresses}::text[])
         `;
-  const targetOwners = new Map(
-    importedOwners.map((row) => [row.address, row.userId]),
-  );
+  const targetOwners = new Map(importedOwners.map((row) => [row.address, row]));
   for (const sourceOwner of data.walletOwners) {
+    const address = normalizedAddress(sourceOwner.address);
+    const targetOwner = targetOwners.get(address);
+    const expectedPrincipalId = data.wallets.find(
+      (wallet) => normalizedAddress(wallet.address) === address,
+    )?.id;
     if (
-      targetOwners.get(normalizedAddress(sourceOwner.address)) !==
-      sourceOwner.userId
+      targetOwner === undefined ||
+      targetOwner.id !== expectedPrincipalId ||
+      targetOwner.userId !== sourceOwner.userId ||
+      !targetOwner.signInEnabled
     ) {
       throw new Error(
         `Target wallet-owner verification failed for ${sourceOwner.address}`,
@@ -446,8 +531,16 @@ export async function verifyImport(
   const accountUserIds =
     userIds.length === 0
       ? []
-      : await sql<{ accountId: string; providerId: string; userId: string }[]>`
+      : await sql<
+          {
+            accountId: string;
+            id: string;
+            providerId: string;
+            userId: string;
+          }[]
+        >`
           SELECT
+            "id",
             "account_id" AS "accountId",
             "provider_id" AS "providerId",
             "user_id" AS "userId"
@@ -455,16 +548,16 @@ export async function verifyImport(
           WHERE "user_id" = ANY(${userIds}::text[])
         `;
   const targetAccounts = new Map(
-    accountUserIds.map((row) => [
-      `${row.providerId}\0${row.accountId}`,
-      row.userId,
-    ]),
+    accountUserIds.map((row) => [`${row.providerId}\0${row.accountId}`, row]),
   );
   for (const sourceAccount of data.accounts) {
+    const targetAccount = targetAccounts.get(
+      `${sourceAccount.providerId}\0${sourceAccount.accountId}`,
+    );
     if (
-      targetAccounts.get(
-        `${sourceAccount.providerId}\0${sourceAccount.accountId}`,
-      ) !== sourceAccount.userId
+      targetAccount === undefined ||
+      targetAccount.id !== sourceAccount.id ||
+      targetAccount.userId !== sourceAccount.userId
     ) {
       throw new Error(
         `Target provider-account verification failed for ${sourceAccount.id}`,
@@ -475,6 +568,8 @@ export async function verifyImport(
   await verifyIdMappings(sql, "wallet_address", data.wallets, [
     ["user_id", (row) => row.userId],
     ["chain_id", (row) => String(row.chainId)],
+    ["address", (row) => normalizedAddress(row.address)],
+    ["is_primary", (row) => String(row.isPrimary)],
   ]);
 }
 
@@ -501,7 +596,11 @@ async function verifyIdMappings<T extends { id: string }>(
       );
     }
     for (const [field, expected] of fields) {
-      if (String(targetRow[field]) !== expected(sourceRow)) {
+      const actual =
+        field === "address"
+          ? String(targetRow[field]).toLowerCase()
+          : String(targetRow[field]);
+      if (actual !== expected(sourceRow)) {
         throw new Error(
           `Target ${table}.${field} verification failed for ${sourceRow.id}`,
         );

@@ -17,7 +17,7 @@ import {
 } from "@peezy.tech/identity-server";
 
 const verify = createAccessTokenVerifier({
-  audience: "my-app",
+  audience: "https://api.my-app.example",
   issuer: "https://identity.peezy.tech/api/auth",
 });
 

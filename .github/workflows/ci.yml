@@ -39,3 +39,8 @@ jobs:
       - run: bun run test
       - run: bun run build
       - run: bun run package:smoke
+      - run: docker build --tag peezy-tech-identity:ci .
+      - name: Verify production image excludes development tooling
+        run: |
+          docker run --rm --entrypoint sh peezy-tech-identity:ci -c \
+            'test -z "$(find /app/node_modules -path "*/drizzle-kit/package.json" -o -path "*/esbuild/package.json")"'

@@ -1,3 +1,5 @@
+import { isIP } from "node:net";
+
 import { z } from "zod";
 
 const optionalString = z.preprocess(
@@ -6,23 +8,47 @@ const optionalString = z.preprocess(
   z.string().trim().min(1).optional(),
 );
 
-const origin = z
+const clientId = z
+  .string()
+  .trim()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9._~-]+$/);
+
+const webUrl = z
   .string()
   .url()
-  .transform((value, context) => {
+  .superRefine((value, context) => {
     const url = new URL(value);
-    if (url.pathname !== "/" || url.search || url.hash) {
+    const loopback = new Set(["127.0.0.1", "[::1]", "localhost"]).has(
+      url.hostname,
+    );
+    if (
+      (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) ||
+      url.username.length > 0 ||
+      url.password.length > 0
+    ) {
       context.addIssue({
         code: "custom",
-        message: "Expected an origin without a path, query, or fragment",
+        message: "Expected HTTPS or a loopback HTTP URL without credentials",
       });
-      return z.NEVER;
     }
-    return url.origin;
   });
 
+const origin = webUrl.transform((value, context) => {
+  const url = new URL(value);
+  if (url.pathname !== "/" || url.search || url.hash) {
+    context.addIssue({
+      code: "custom",
+      message: "Expected an origin without a path, query, or fragment",
+    });
+    return z.NEVER;
+  }
+  return url.origin;
+});
+
 const appClientSchema = z.object({
-  id: z.string().trim().min(1).max(128),
+  id: clientId,
   name: z.string().trim().min(1).max(128),
   origins: z.array(origin).min(1),
   secret: z.string().min(32),
@@ -31,11 +57,14 @@ const appClientSchema = z.object({
 });
 
 const oidcClientSchema = z.object({
-  audiences: z.array(z.string().trim().min(1)).default([]),
-  clientId: z.string().trim().min(1).max(128),
+  audiences: z
+    .array(webUrl)
+    .default([])
+    .transform((values) => [...new Set(values)]),
+  clientId,
   clientSecret: z.string().min(32),
   name: z.string().trim().min(1).max(128),
-  redirectUris: z.array(z.string().url()).min(1),
+  redirectUris: z.array(webUrl).min(1),
 });
 
 function jsonEnv<T extends z.ZodType>(
@@ -74,6 +103,7 @@ const envSchema = z.object({
   IDENTITY_OIDC_CLIENTS: jsonEnv(z.array(oidcClientSchema), []),
   IDENTITY_PORT: z.coerce.number().int().positive().default(8790),
   IDENTITY_SECRET: z.string().min(32),
+  IDENTITY_TRUSTED_PROXIES: z.string().default(""),
   IDENTITY_TRUSTED_ORIGINS: z.string().default(""),
   TELEGRAM_OAUTH_CLIENT_ID: optionalString,
   TELEGRAM_OAUTH_CLIENT_SECRET: optionalString,
@@ -104,6 +134,7 @@ export type IdentityConfig = {
   port: number;
   secret: string;
   socialProviders: Partial<Record<SocialProviderName, SocialProviderConfig>>;
+  trustedProxies: string[];
   trustedOrigins: string[];
 };
 
@@ -164,6 +195,10 @@ export function loadConfig(
   const clientOrigins = parsed.IDENTITY_APP_CLIENTS.flatMap(
     (client) => client.origins,
   );
+  const trustedProxies = parsed.IDENTITY_TRUSTED_PROXIES.split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .map(parseTrustedProxy);
 
   return {
     appClients: uniqueBy(parsed.IDENTITY_APP_CLIENTS, (client) => client.id),
@@ -176,6 +211,7 @@ export function loadConfig(
     port: parsed.IDENTITY_PORT,
     secret: parsed.IDENTITY_SECRET,
     socialProviders,
+    trustedProxies,
     trustedOrigins: [...new Set([...configuredOrigins, ...clientOrigins])],
   };
 }
@@ -206,4 +242,21 @@ function uniqueBy<T>(values: T[], key: (value: T) => string): T[] {
     seen.add(identity);
   }
   return values;
+}
+
+function parseTrustedProxy(value: string): string {
+  const [address, prefix, extra] = value.split("/");
+  const version = address === undefined ? 0 : isIP(address);
+  const maxPrefix = version === 4 ? 32 : 128;
+  if (
+    version === 0 ||
+    extra !== undefined ||
+    (prefix !== undefined &&
+      (!/^\d+$/.test(prefix) ||
+        Number(prefix) < 0 ||
+        Number(prefix) > maxPrefix))
+  ) {
+    throw new Error(`Invalid trusted proxy address or CIDR: ${value}`);
+  }
+  return value;
 }

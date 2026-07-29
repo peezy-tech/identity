@@ -48,6 +48,7 @@ Run the service after configuring the variables documented in
 bun run dev
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for the trust boundaries and
+See [`docs/architecture.md`](docs/architecture.md) for the trust boundaries,
+[`docs/operations.md`](docs/operations.md) for the production contract, and
 [`docs/pledge-cash-migration.md`](docs/pledge-cash-migration.md) for the
 compatibility migration.

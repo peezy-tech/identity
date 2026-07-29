@@ -1,4 +1,5 @@
 import type { SocialProviderName } from "./config";
+import { HOSTED_WALLET_STATEMENT } from "./constants";
 
 export function homePage(): string {
   return document(
@@ -31,6 +32,7 @@ export function signInPage(
     )
     .join("");
   const providersJson = JSON.stringify(providers).replaceAll("<", "\\u003c");
+  const walletStatementJson = JSON.stringify(HOSTED_WALLET_STATEMENT);
 
   return document(
     "Sign in · peezy.tech",
@@ -51,8 +53,10 @@ export function signInPage(
       <script nonce="${nonce}">
         const providers = ${providersJson};
         const status = document.querySelector("#status");
-        const callbackURL =
-          location.origin + "/api/auth/oauth2/authorize" + location.search;
+        const oauthQuery = new URLSearchParams(location.search);
+        const callbackURL = oauthQuery.has("client_id")
+          ? location.origin + "/api/auth/oauth2/authorize" + location.search
+          : location.origin + "/";
 
         async function jsonRequest(path, body) {
           const response = await fetch(path, {
@@ -103,7 +107,7 @@ export function signInPage(
             const expirationTime = new Date(Date.now() + 10 * 60 * 1000).toISOString();
             const message =
               location.host + " wants you to sign in with your Ethereum account:\\n" +
-              address + "\\n\\nSign in to peezy.tech identity.\\n\\nURI: " +
+              address + "\\n\\n" + ${walletStatementJson} + "\\n\\nURI: " +
               location.origin + "\\nVersion: 1\\nChain ID: " + chainId +
               "\\nNonce: " + nonceResult.nonce + "\\nIssued At: " + issuedAt +
               "\\nExpiration Time: " + expirationTime;

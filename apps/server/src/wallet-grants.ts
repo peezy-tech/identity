@@ -1,11 +1,12 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 import {
+  PeezyUserSchema,
   type PeezyUser,
   type WalletChallengeResponse,
   type WalletGrantResponse,
 } from "@peezy.tech/identity";
-import { and, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, eq, gt, isNull, lt, sql } from "drizzle-orm";
 import { getAddress, verifyMessage, type Hex } from "viem";
 import { createSiweMessage, parseSiweMessage } from "viem/siwe";
 
@@ -80,16 +81,21 @@ export async function createWalletChallenge(input: {
     version: "1",
   });
 
-  await input.db.insert(walletChallenge).values({
-    address,
-    chainId: input.chainId,
-    clientId: client.id,
-    domain,
-    expiresAt,
-    issuedAt,
-    nonce,
-    statement,
-    uri: origin,
+  await input.db.transaction(async (transaction) => {
+    await transaction
+      .delete(walletChallenge)
+      .where(lt(walletChallenge.expiresAt, issuedAt));
+    await transaction.insert(walletChallenge).values({
+      address,
+      chainId: input.chainId,
+      clientId: client.id,
+      domain,
+      expiresAt,
+      issuedAt,
+      nonce,
+      statement,
+      uri: origin,
+    });
   });
 
   return {
@@ -222,6 +228,16 @@ export async function createWalletGrant(input: {
         "Wallet is already linked to another account",
       );
     }
+    if (
+      input.sessionSubject === undefined &&
+      existingPrincipal !== undefined &&
+      !existingPrincipal.signInEnabled
+    ) {
+      throw new WalletGrantError(
+        403,
+        "Wallet sign-in is disabled for this credential",
+      );
+    }
 
     let subject = input.sessionSubject ?? existingPrincipal?.userId;
     if (subject !== undefined) {
@@ -291,6 +307,7 @@ export async function createWalletGrant(input: {
       .onConflictDoNothing();
 
     const grantId = randomUUID();
+    await tx.delete(walletGrant).where(lt(walletGrant.expiresAt, now));
     await tx.insert(walletGrant).values({
       clientId: challenge.clientId,
       createdAt: now,
@@ -385,19 +402,22 @@ export function toPeezyUser(input: {
   status: string;
 }): PeezyUser {
   const syntheticEmail = input.email.endsWith(".invalid");
-  return {
+  const displayName = input.name.trim().slice(0, 128);
+  const avatarUrl = PeezyUserSchema.shape.avatarUrl
+    .unwrap()
+    .safeParse(input.image?.trim());
+  const primaryEmail = PeezyUserSchema.shape.primaryEmail.unwrap().safeParse({
+    value: input.email,
+    verified: input.emailVerified,
+  });
+  return PeezyUserSchema.parse({
     createdAt: input.createdAt.toISOString(),
     id: input.id,
     status: input.status === "disabled" ? "disabled" : "active",
-    ...(input.image === null ? {} : { avatarUrl: input.image }),
-    ...(input.name.trim().length === 0 ? {} : { displayName: input.name }),
-    ...(syntheticEmail
+    ...(avatarUrl.success ? { avatarUrl: avatarUrl.data } : {}),
+    ...(displayName.length === 0 ? {} : { displayName }),
+    ...(syntheticEmail || !primaryEmail.success
       ? {}
-      : {
-          primaryEmail: {
-            value: input.email,
-            verified: input.emailVerified,
-          },
-        }),
-  };
+      : { primaryEmail: primaryEmail.data }),
+  });
 }

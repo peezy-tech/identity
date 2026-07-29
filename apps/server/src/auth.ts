@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { oauthProvider } from "@better-auth/oauth-provider";
-import { betterAuth } from "better-auth";
+import { betterAuth, type BetterAuthPlugin } from "better-auth";
 import { genericOAuth, jwt, siwe } from "better-auth/plugins";
 import { and, eq, sql } from "drizzle-orm";
 import {
@@ -12,7 +12,12 @@ import {
   type JWTVerifyGetKey,
 } from "jose";
 import { verifyMessage, type Address, type Hex } from "viem";
+import { parseSiweMessage } from "viem/siwe";
 
+import {
+  HOSTED_WALLET_PROOF_TTL_MS,
+  HOSTED_WALLET_STATEMENT,
+} from "./constants";
 import type { IdentityConfig, SocialProviderName } from "./config";
 import type { IdentityDb } from "./db/client";
 import * as schema from "./db/schema";
@@ -48,7 +53,6 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
                 discoveryUrl: TELEGRAM_DISCOVERY_URL,
                 getUserInfo: (tokens) =>
                   telegramUserInfo(tokens, telegram.clientId),
-                issuer: TELEGRAM_ISSUER,
                 pkce: true,
                 providerId: "telegram",
                 scopes: ["openid", "profile"],
@@ -57,6 +61,30 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
             ],
           }),
         ];
+  const resourceAudiences = [
+    ...new Set(config.oidcClients.flatMap((client) => client.audiences)),
+  ];
+  const providerPlugin = oauthProvider({
+    accessTokenExpiresIn: 10 * 60,
+    cachedResources: new Set(resourceAudiences),
+    cachedTrustedClients: new Set(
+      config.oidcClients.map((client) => client.clientId),
+    ),
+    clientPrivileges: () => false,
+    codeExpiresIn: 5 * 60,
+    consentPage: "/consent",
+    enforcePerClientResources: true,
+    idTokenExpiresIn: 10 * 60,
+    loginPage: "/sign-in",
+    refreshTokenExpiresIn: 30 * 24 * 60 * 60,
+    resourcePrivileges: () => false,
+    resources: resourceAudiences,
+    scopes: ["openid", "profile", "email", "offline_access"],
+    silenceWarnings: {
+      oauthAuthServerConfig: true,
+      openidConfig: true,
+    },
+  }) as unknown as BetterAuthPlugin;
 
   const auth = betterAuth({
     appName: "peezy.tech",
@@ -90,10 +118,33 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
     databaseHooks: {
       account: {
         create: {
+          after: async (createdAccount) => {
+            if (
+              !socialProviderNames.includes(
+                createdAccount.providerId as SocialProviderName,
+              )
+            ) {
+              return;
+            }
+            await db.insert(schema.identityAuditEvent).values({
+              actorUserId: createdAccount.userId,
+              credentialId: createdAccount.id,
+              id: crypto.randomUUID(),
+              kind: "social.linked",
+              metadata: { provider: createdAccount.providerId },
+              userId: createdAccount.userId,
+            });
+          },
           before: async (account) => ({ data: { ...account, idToken: null } }),
         },
         update: {
           before: async (account) => ({ data: { ...account, idToken: null } }),
+        },
+      },
+      session: {
+        create: {
+          before: async (createdSession) =>
+            isActiveIdentityUser(db, createdSession.userId),
         },
       },
     },
@@ -135,6 +186,9 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
     advanced: {
       cookiePrefix: "peezy-identity",
       database: { generateId: "uuid" },
+      ipAddress: {
+        trustedProxies: config.trustedProxies,
+      },
       useSecureCookies: new URL(config.baseUrl).protocol === "https:",
     },
     rateLimit: {
@@ -157,32 +211,13 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
         verifyMessage: ({ address, message, signature }) =>
           verifyHostedWalletSignature(db, {
             address: address.toLowerCase() as Address,
+            baseUrl: config.baseUrl,
             message,
             signature,
           }),
       }),
       sessionHandoffPlugin(db, config),
-      oauthProvider({
-        accessTokenExpiresIn: 10 * 60,
-        cachedTrustedClients: new Set(
-          config.oidcClients.map((client) => client.clientId),
-        ),
-        clientPrivileges: () => false,
-        codeExpiresIn: 5 * 60,
-        consentPage: "/consent",
-        idTokenExpiresIn: 10 * 60,
-        loginPage: "/sign-in",
-        refreshTokenExpiresIn: 30 * 24 * 60 * 60,
-        scopes: ["openid", "profile", "email", "offline_access"],
-        silenceWarnings: {
-          oauthAuthServerConfig: true,
-          openidConfig: true,
-        },
-        validAudiences: [
-          config.baseUrl,
-          ...config.oidcClients.flatMap((client) => client.audiences),
-        ],
-      }),
+      providerPlugin,
     ],
   });
 
@@ -222,10 +257,33 @@ async function verifyHostedWalletSignature(
   db: IdentityDb,
   input: {
     address: Address;
+    baseUrl: string;
     message: string;
     signature: string;
   },
 ): Promise<boolean> {
+  let parsed: ReturnType<typeof parseSiweMessage>;
+  try {
+    parsed = parseSiweMessage(input.message);
+    const expiresAt =
+      parsed.expirationTime === undefined
+        ? Number.NaN
+        : parsed.expirationTime.getTime();
+    if (
+      parsed.statement !== HOSTED_WALLET_STATEMENT ||
+      parsed.uri === undefined ||
+      new URL(parsed.uri).origin !== new URL(input.baseUrl).origin ||
+      parsed.version !== "1" ||
+      !Number.isFinite(expiresAt) ||
+      expiresAt <= Date.now() ||
+      expiresAt > Date.now() + HOSTED_WALLET_PROOF_TTL_MS + 60_000
+    ) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
   const recovered = await verifyMessage({
     address: input.address,
     message: input.message,
@@ -234,8 +292,13 @@ async function verifyHostedWalletSignature(
   if (!recovered) return false;
 
   const [owner] = await db
-    .select({ userId: schema.walletPrincipal.userId })
+    .select({
+      signInEnabled: schema.walletPrincipal.signInEnabled,
+      status: schema.user.status,
+      userId: schema.walletPrincipal.userId,
+    })
     .from(schema.walletPrincipal)
+    .innerJoin(schema.user, eq(schema.user.id, schema.walletPrincipal.userId))
     .where(
       and(
         eq(schema.walletPrincipal.accountKind, "eoa"),
@@ -244,6 +307,7 @@ async function verifyHostedWalletSignature(
     )
     .limit(1);
   if (owner === undefined) return true;
+  if (!owner.signInEnabled || owner.status !== "active") return false;
 
   const [credential] = await db
     .select({ id: schema.walletAddress.id })
@@ -256,6 +320,18 @@ async function verifyHostedWalletSignature(
     )
     .limit(1);
   return credential !== undefined;
+}
+
+async function isActiveIdentityUser(
+  db: IdentityDb,
+  subject: string,
+): Promise<boolean> {
+  const [identityUser] = await db
+    .select({ status: schema.user.status })
+    .from(schema.user)
+    .where(eq(schema.user.id, subject))
+    .limit(1);
+  return identityUser?.status === "active";
 }
 
 export async function verifyTelegramIdToken(

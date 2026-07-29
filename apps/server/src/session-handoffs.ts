@@ -6,7 +6,7 @@ import type {
 } from "@peezy.tech/identity";
 import { APIError, createAuthEndpoint } from "better-auth/api";
 import { setSessionCookie } from "better-auth/cookies";
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { and, eq, gt, isNull, lt } from "drizzle-orm";
 import { z } from "zod";
 
 import type { IdentityConfig } from "./config";
@@ -58,6 +58,9 @@ export async function createSocialLinkHandoff(input: {
   const expiresAt = new Date(now.getTime() + SESSION_HANDOFF_TTL_MS);
   const token = randomBytes(32).toString("base64url");
   await input.db.transaction(async (transaction) => {
+    await transaction
+      .delete(sessionHandoff)
+      .where(lt(sessionHandoff.expiresAt, now));
     await transaction.insert(sessionHandoff).values({
       callbackUrl: callbackUrl.toString(),
       clientId: client.id,

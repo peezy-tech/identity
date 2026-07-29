@@ -6,9 +6,17 @@ export const EvmAddressSchema = z
   .string()
   .regex(/^0x[a-fA-F0-9]{40}$/)
   .transform((value) => value.toLowerCase() as `0x${string}`);
+export const HttpUrlSchema = z
+  .string()
+  .url()
+  .refine((value) => {
+    if (!URL.canParse(value)) return false;
+    const protocol = new URL(value).protocol;
+    return protocol === "https:" || protocol === "http:";
+  }, "Expected an HTTP or HTTPS URL");
 
 export const PeezyUserSchema = z.object({
-  avatarUrl: z.string().url().optional(),
+  avatarUrl: HttpUrlSchema.optional(),
   createdAt: IsoDateSchema,
   displayName: z.string().trim().min(1).max(128).optional(),
   id: IdentitySubjectSchema,

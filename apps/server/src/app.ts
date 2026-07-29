@@ -9,6 +9,7 @@ import {
 } from "@peezy.tech/identity";
 import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
 import { ZodError } from "zod";
@@ -46,6 +47,22 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
   ]);
 
   app.use("*", secureHeaders());
+  app.use(
+    "/v1/*",
+    bodyLimit({
+      maxSize: 20_000,
+      onError: (context) =>
+        errorResponse(context, 413, "Request body is too large"),
+    }),
+  );
+  app.use(
+    "/api/auth/*",
+    bodyLimit({
+      maxSize: 100_000,
+      onError: (context) =>
+        errorResponse(context, 413, "Request body is too large"),
+    }),
+  );
   app.use(
     "/v1/*",
     cors({
@@ -151,8 +168,8 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     const origin = requiredOrigin(context.req.raw);
     const body = WalletChallengeRequestSchema.parse(await boundedJson(context));
     await requireRateLimit(dependencies.db, {
-      key: `wallet-challenge:${body.clientId}:${origin}:${body.walletAddress}`,
-      limit: 20,
+      key: `wallet-challenge:${body.clientId}:${origin}`,
+      limit: 300,
       windowMs: 5 * 60 * 1_000,
     });
     return context.json(
@@ -334,14 +351,9 @@ class RequestError extends Error {
 
 async function boundedJson(context: {
   req: {
-    header: (name: string) => string | undefined;
     json: () => Promise<unknown>;
   };
 }): Promise<unknown> {
-  const contentLength = Number(context.req.header("content-length") ?? "0");
-  if (Number.isFinite(contentLength) && contentLength > 20_000) {
-    throw new RequestError(413, "Request body is too large");
-  }
   try {
     return await context.req.json();
   } catch {

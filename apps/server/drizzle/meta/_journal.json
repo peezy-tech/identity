@@ -43,6 +43,13 @@
       "when": 1785332970738,
       "tag": "0005_misty_living_lightning",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1785337524745,
+      "tag": "0006_flashy_winter_soldier",
+      "breakpoints": true
     }
   ]
 }
