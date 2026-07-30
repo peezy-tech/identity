@@ -74,10 +74,13 @@ export function signInPage(
 
         async function socialSignIn(provider) {
           status.textContent = "Opening " + provider + "…";
-          const result = await jsonRequest("/api/auth/sign-in/social", {
-            callbackURL,
-            provider,
-          });
+          const telegram = provider === "telegram";
+          const result = await jsonRequest(
+            telegram ? "/api/auth/sign-in/oauth2" : "/api/auth/sign-in/social",
+            telegram
+              ? { callbackURL, providerId: "telegram" }
+              : { callbackURL, provider }
+          );
           if (!result.url) throw new Error("The provider did not return a redirect");
           location.assign(result.url);
         }
