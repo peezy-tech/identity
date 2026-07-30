@@ -17,6 +17,7 @@ import { createSiweMessage } from "viem/siwe";
 
 import {
   assertDistinctDatabases,
+  assertTargetSchema,
   importIdentity,
   readLegacyIdentity,
   validateLegacyIdentity,
@@ -1000,6 +1001,8 @@ if (databaseUrl === undefined) {
     });
 
     test("rejects a same-database migration and rolls back failed verification", async () => {
+      await expect(assertTargetSchema(database.sql)).resolves.toBeUndefined();
+
       await expect(
         assertDistinctDatabases(database.sql, database.sql),
       ).rejects.toThrow(
