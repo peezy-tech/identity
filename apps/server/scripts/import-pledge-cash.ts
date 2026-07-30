@@ -234,10 +234,10 @@ export function validateLegacyIdentity(data: ImportData): void {
 }
 
 export async function assertTargetSchema(sql: postgres.Sql): Promise<void> {
-  const [result] = await sql<{ identityTable: string | null }[]>`
-    SELECT to_regclass('public.user')::text AS "identityTable"
+  const [result] = await sql<{ identityTableExists: boolean }[]>`
+    SELECT to_regclass('public.user') IS NOT NULL AS "identityTableExists"
   `;
-  if (result?.identityTable !== "user") {
+  if (result?.identityTableExists !== true) {
     throw new Error(
       "Target identity schema is missing; start the provider migrations first",
     );
