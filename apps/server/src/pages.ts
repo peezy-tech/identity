@@ -21,6 +21,75 @@ export function homePage(): string {
   );
 }
 
+export function accountPage(
+  config: {
+    privyAppId?: string;
+    providers: SocialProviderName[];
+  },
+  nonce: string,
+): string {
+  const clientConfig = JSON.stringify({
+    privyAppId: config.privyAppId ?? null,
+    providers: config.providers,
+  }).replaceAll("<", "\\u003c");
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Account · peezy.tech</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+      * { box-sizing: border-box; }
+      body { min-height: 100vh; margin: 0; color: #f5f4ef; background: #0c0e0d; }
+      body::before { content: ""; position: fixed; inset: 0; pointer-events: none;
+        background: radial-gradient(circle at 82% 8%, rgba(185,242,124,.11), transparent 28rem); }
+      button, a { font: inherit; }
+      .account-shell { position: relative; width: min(74rem, calc(100vw - 2rem)); margin: 0 auto;
+        padding: 2rem 0 5rem; }
+      .account-nav { display: flex; justify-content: space-between; align-items: center;
+        padding-bottom: 1.5rem; border-bottom: 1px solid #272b28; }
+      .account-brand { color: #f5f4ef; font-weight: 760; letter-spacing: -.03em; text-decoration: none; }
+      .account-kicker { color: #b9f27c; font: 700 .72rem/1 ui-monospace, monospace;
+        letter-spacing: .14em; text-transform: uppercase; }
+      .account-heading { max-width: 45rem; margin: 4.5rem 0 4rem; }
+      .account-heading h1 { margin: .8rem 0 1rem; font-size: clamp(3.2rem, 8vw, 6.8rem);
+        line-height: .88; letter-spacing: -.075em; }
+      .account-heading p { max-width: 34rem; color: #aeb2ac; font-size: 1.05rem; line-height: 1.65; }
+      #account-root { min-height: 24rem; }
+      .account-loading { color: #8f948e; border-top: 1px solid #272b28; padding: 1.5rem 0; }
+      @media (max-width: 640px) {
+        .account-shell { width: min(100% - 1.25rem, 74rem); padding-top: 1.25rem; }
+        .account-heading { margin: 3rem 0; }
+      }
+      @media (prefers-reduced-motion: no-preference) {
+        .account-heading { animation: account-enter .45s ease-out both; }
+        #account-root { animation: account-enter .45s .08s ease-out both; }
+        @keyframes account-enter { from { opacity: 0; transform: translateY(10px); }
+          to { opacity: 1; transform: translateY(0); } }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="account-shell">
+      <nav class="account-nav" aria-label="Account navigation">
+        <a class="account-brand" href="/">peezy.tech</a>
+        <span class="account-kicker">Identity</span>
+      </nav>
+      <header class="account-heading">
+        <span class="account-kicker">Account center</span>
+        <h1>Your ways in.</h1>
+        <p>Review your credentials, bring over a Lobby account, or consolidate duplicate peezy.tech identities.</p>
+      </header>
+      <div id="account-root"><p class="account-loading">Loading your identity…</p></div>
+    </div>
+    <script nonce="${nonce}">window.__PEEZY_ACCOUNT_CONFIG__ = ${clientConfig};</script>
+    <script type="module" src="/assets/account-client.js"></script>
+  </body>
+</html>`;
+}
+
 export function signInPage(
   providers: SocialProviderName[],
   nonce: string,
@@ -44,6 +113,7 @@ export function signInPage(
         <div class="stack" id="social-providers">${socialButtons}</div>
         ${providers.length > 0 ? '<p class="divider"><span>or</span></p>' : ""}
         <button class="wallet" id="wallet" type="button">Continue with an EVM wallet</button>
+        <button class="wallet" id="solana-wallet" type="button">Continue with a Solana wallet</button>
         <p class="status" id="status" role="status" aria-live="polite"></p>
         <p class="fine-print">
           A wallet is optional. Connecting one proves ownership and links it as
@@ -54,9 +124,12 @@ export function signInPage(
         const providers = ${providersJson};
         const status = document.querySelector("#status");
         const oauthQuery = new URLSearchParams(location.search);
+        const requestedReturn = oauthQuery.get("return_to");
+        const safeReturn = requestedReturn && requestedReturn.startsWith("/") &&
+          !requestedReturn.startsWith("//") ? requestedReturn : "/";
         const callbackURL = oauthQuery.has("client_id")
           ? location.origin + "/api/auth/oauth2/authorize" + location.search
-          : location.origin + "/";
+          : location.origin + safeReturn;
 
         async function jsonRequest(path, body) {
           const response = await fetch(path, {
@@ -121,6 +194,40 @@ export function signInPage(
               message,
               signature,
               walletAddress: address,
+            });
+            location.assign(callbackURL);
+          } catch (error) {
+            showError(error);
+          }
+        });
+
+        document.querySelector("#solana-wallet").addEventListener("click", async () => {
+          try {
+            if (!window.solana) {
+              throw new Error("No Solana wallet was detected in this browser");
+            }
+            status.textContent = "Requesting your Solana wallet…";
+            const connected = await window.solana.connect();
+            const address = connected.publicKey.toString();
+            const challenge = await jsonRequest("/api/auth/siws/challenge", {
+              address,
+            });
+            const message = new TextEncoder().encode(challenge.message);
+            const signed = await window.solana.signMessage(message);
+            if (signed.signedMessage) {
+              const exact = signed.signedMessage.length === message.length &&
+                signed.signedMessage.every((byte, index) => byte === message[index]);
+              if (!exact) throw new Error("The wallet changed the SIWS message before signing");
+            }
+            let binarySignature = "";
+            for (const byte of signed.signature) {
+              binarySignature += String.fromCharCode(byte);
+            }
+            status.textContent = "Verifying your Solana wallet…";
+            await jsonRequest("/api/auth/siws/verify", {
+              challengeId: challenge.challengeId,
+              message: challenge.message,
+              signature: btoa(binarySignature),
             });
             location.assign(callbackURL);
           } catch (error) {

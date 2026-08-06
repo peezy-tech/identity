@@ -1,5 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { createHash, randomBytes } from "node:crypto";
+import {
+  createHash,
+  generateKeyPairSync,
+  randomBytes,
+  sign,
+} from "node:crypto";
 import { resolve } from "node:path";
 
 import {
@@ -8,6 +13,7 @@ import {
   WalletGrantExchangeResponseSchema,
   WalletGrantResponseSchema,
 } from "@peezy.tech/identity";
+import bs58 from "bs58";
 import { eq } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { decodeJwt } from "jose";
@@ -24,13 +30,24 @@ import {
   verifyImport,
 } from "../scripts/import-pledge-cash";
 import { createIdentityApp } from "../src/app";
-import { createIdentityAuth } from "../src/auth";
+import { createIdentityAuth, createIdentityProofAuth } from "../src/auth";
 import { seedConfiguredClients } from "../src/clients";
 import type { IdentityConfig } from "../src/config";
 import { HOSTED_WALLET_STATEMENT } from "../src/constants";
 import { createDbClient, type IdentityDbClient } from "../src/db/client";
-import { rateLimit, user, walletAddress } from "../src/db/schema";
+import {
+  account,
+  identitySubjectMerge,
+  privyMigrationClaim,
+  privyMigrationIdentity,
+  rateLimit,
+  session,
+  user,
+  walletAddress,
+  walletPrincipal,
+} from "../src/db/schema";
 import { identityMe } from "../src/identity";
+import { PrivyMigrationError, type PrivyGateway } from "../src/privy-migration";
 import { MAX_RATE_LIMIT_WINDOW_MS, consumeRateLimit } from "../src/rate-limit";
 import { consumeSessionHandoff } from "../src/session-handoffs";
 
@@ -53,6 +70,10 @@ if (databaseUrl === undefined) {
     const hostedWallet = privateKeyToAccount(
       "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
     );
+    const migratingWallet = privateKeyToAccount(
+      "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    const migratingSolanaWallet = createSolanaWallet();
     const config: IdentityConfig = {
       appClients: [
         {
@@ -76,6 +97,10 @@ if (databaseUrl === undefined) {
         },
       ],
       port: 8790,
+      privyMigration: {
+        appId: "legacy-lobby-app",
+        appSecret: "legacy-lobby-secret",
+      },
       secret: "identity-test-secret-01234567890123456789",
       socialProviders: {
         github: {
@@ -89,6 +114,74 @@ if (databaseUrl === undefined) {
 
     let database: IdentityDbClient;
     let app: ReturnType<typeof createIdentityApp>;
+    const privyGateway: PrivyGateway = {
+      async authenticateAccessToken(accessToken) {
+        if (
+          accessToken !== "valid-legacy-token" &&
+          accessToken !== "wallet-bundle-token" &&
+          accessToken !== "solana-wallet-bundle-token" &&
+          accessToken !== "concurrent-token"
+        ) {
+          throw new PrivyMigrationError(
+            401,
+            "invalid_proof",
+            "Privy authentication could not be verified",
+          );
+        }
+        if (accessToken === "wallet-bundle-token") {
+          return {
+            createdAt: new Date("2025-01-02T00:00:00Z"),
+            id: "did:privy:legacy-wallet-person",
+            linkedAccounts: [
+              {
+                address: migratingWallet.address,
+                chain_type: "ethereum",
+                type: "embedded_wallet",
+              },
+            ],
+          };
+        }
+        if (accessToken === "solana-wallet-bundle-token") {
+          return {
+            createdAt: new Date("2025-01-02T00:00:00Z"),
+            id: "did:privy:legacy-solana-person",
+            linkedAccounts: [
+              {
+                address: migratingSolanaWallet.address,
+                chain_type: "solana",
+                type: "embedded_wallet",
+              },
+            ],
+          };
+        }
+        if (accessToken === "concurrent-token") {
+          return {
+            createdAt: new Date("2025-01-03T00:00:00Z"),
+            id: "did:privy:concurrent-person",
+            linkedAccounts: [],
+          };
+        }
+        return {
+          createdAt: new Date("2025-01-01T00:00:00Z"),
+          id: "did:privy:legacy-person",
+          linkedAccounts: [
+            {
+              subject: "github-legacy",
+              type: "github_oauth",
+              username: "legacy",
+            },
+            { subject: "discord-one", type: "discord_oauth" },
+            { subject: "discord-two", type: "discord_oauth" },
+            {
+              address: "0x3000000000000000000000000000000000000000",
+              chain_type: "ethereum",
+              type: "wallet",
+            },
+            { fid: 42, type: "farcaster" },
+          ],
+        };
+      },
+    };
 
     beforeAll(async () => {
       database = createDbClient(databaseUrl);
@@ -107,6 +200,8 @@ if (databaseUrl === undefined) {
         auth,
         config,
         db: database.db,
+        privyGateway,
+        proofAuth: createIdentityProofAuth(config, database.db),
         socialProviderNames,
       });
     });
@@ -174,6 +269,439 @@ if (databaseUrl === undefined) {
         },
       );
       expect(authResponse.status).toBe(413);
+    });
+
+    test("claims a complete Privy bundle idempotently and never claims it for another subject", async () => {
+      const first = privateKeyToAccount(
+        "0x7777777777777777777777777777777777777777777777777777777777777777",
+      );
+      const second = privateKeyToAccount(
+        "0x8888888888888888888888888888888888888888888888888888888888888888",
+      );
+      const firstSignIn = await signInHostedWallet(app, config, first);
+      const secondSignIn = await signInHostedWallet(app, config, second);
+
+      const claim = async (cookie: string, token = "valid-legacy-token") => {
+        const attemptResponse = await app.request(
+          "https://identity.test/v1/migrations/privy/attempts",
+          {
+            headers: { Cookie: cookie, Origin: config.baseUrl },
+            method: "POST",
+          },
+        );
+        expect(attemptResponse.status).toBe(201);
+        const attempt = (await attemptResponse.json()) as {
+          attemptId: string;
+          csrfToken: string;
+        };
+        return app.request("https://identity.test/v1/migrations/privy/claims", {
+          body: JSON.stringify(attempt),
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            Cookie: cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        });
+      };
+
+      const firstClaim = await claim(firstSignIn.cookie);
+      expect(firstClaim.status).toBe(201);
+      const firstBody = (await firstClaim.json()) as { identities: unknown[] };
+      expect(firstBody.identities).toHaveLength(5);
+      expect((await claim(firstSignIn.cookie)).status).toBe(201);
+      const claimedElsewhere = await claim(secondSignIn.cookie);
+      expect(claimedElsewhere.status).toBe(409);
+      expect(await claimedElsewhere.json()).toMatchObject({
+        error: { code: "claimed_elsewhere" },
+      });
+
+      const [claimRow] = await database.db.select().from(privyMigrationClaim);
+      expect(claimRow?.userId).toBe(firstSignIn.userId);
+      const identityRows = await database.db
+        .select()
+        .from(privyMigrationIdentity);
+      expect(identityRows).toHaveLength(5);
+
+      const concurrentOne = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ),
+      );
+      const concurrentTwo = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        ),
+      );
+      const outcomes = await Promise.all([
+        claim(concurrentOne.cookie, "concurrent-token"),
+        claim(concurrentTwo.cookie, "concurrent-token"),
+      ]);
+      expect(outcomes.map((response) => response.status).sort()).toEqual([
+        201, 409,
+      ]);
+      expect(
+        await database.db
+          .select()
+          .from(privyMigrationClaim)
+          .where(
+            eq(privyMigrationClaim.privyUserId, "did:privy:concurrent-person"),
+          ),
+      ).toHaveLength(1);
+    });
+
+    test("consolidates a proof-authenticated subject transactionally and revokes both sessions", async () => {
+      const survivorWallet = privateKeyToAccount(
+        "0x5555555555555555555555555555555555555555555555555555555555555555",
+      );
+      const sourceWallet = privateKeyToAccount(
+        "0x6666666666666666666666666666666666666666666666666666666666666666",
+      );
+      const survivor = await signInHostedWallet(app, config, survivorWallet);
+      const source = await signInHostedWallet(app, config, sourceWallet);
+      await database.db.insert(account).values({
+        accountId: "github-source-merge",
+        id: crypto.randomUUID(),
+        providerId: "github",
+        userId: source.userId,
+      });
+      const proof = await signInHostedWallet(
+        app,
+        config,
+        sourceWallet,
+        "/api/proof-auth",
+        "peezy-proof.session_token",
+      );
+      const cookies = `${survivor.cookie}; ${proof.cookie}`;
+      const previewResponse = await app.request(
+        "https://identity.test/v1/account-merges/proofs",
+        {
+          headers: { Cookie: cookies, Origin: config.baseUrl },
+          method: "POST",
+        },
+      );
+      expect(previewResponse.status).toBe(201);
+      const preview = (await previewResponse.json()) as { attemptId: string };
+      expect(
+        await database.db
+          .select({ status: identitySubjectMerge.status })
+          .from(identitySubjectMerge)
+          .where(eq(identitySubjectMerge.id, preview.attemptId)),
+      ).toEqual([{ status: "prepared" }]);
+      const commitResponse = await app.request(
+        "https://identity.test/v1/account-merges/commit",
+        {
+          body: JSON.stringify({ attemptId: preview.attemptId }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(commitResponse.status).toBe(200);
+      expect(await commitResponse.json()).toEqual({ merged: true });
+      expect(
+        await database.db
+          .select({ status: identitySubjectMerge.status })
+          .from(identitySubjectMerge)
+          .where(eq(identitySubjectMerge.id, preview.attemptId)),
+      ).toEqual([{ status: "committed" }]);
+      const [sourceRow] = await database.db
+        .select({ status: user.status })
+        .from(user)
+        .where(eq(user.id, source.userId));
+      expect(sourceRow?.status).toBe("merged");
+      expect(
+        await database.db
+          .select()
+          .from(session)
+          .where(eq(session.userId, survivor.userId)),
+      ).toHaveLength(0);
+      expect(
+        await database.db
+          .select()
+          .from(session)
+          .where(eq(session.userId, source.userId)),
+      ).toHaveLength(0);
+      expect(
+        (await identityMe(database.db, survivor.userId)).credentials,
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            address: sourceWallet.address.toLowerCase(),
+            kind: "wallet",
+          }),
+          expect.objectContaining({ kind: "social", provider: "github" }),
+        ]),
+      );
+    });
+
+    test("keeps a claimed parent while a wallet identity independently transitions to linked", async () => {
+      const survivorWallet = privateKeyToAccount(
+        "0x9999999999999999999999999999999999999999999999999999999999999999",
+      );
+      const survivor = await signInHostedWallet(app, config, survivorWallet);
+      const attemptResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/attempts",
+        {
+          headers: { Cookie: survivor.cookie, Origin: config.baseUrl },
+          method: "POST",
+        },
+      );
+      const attempt = (await attemptResponse.json()) as {
+        attemptId: string;
+        csrfToken: string;
+      };
+      const claimResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/claims",
+        {
+          body: JSON.stringify(attempt),
+          headers: {
+            Authorization: "Bearer wallet-bundle-token",
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(claimResponse.status).toBe(201);
+      expect(await claimResponse.json()).toMatchObject({
+        identities: [{ disposition: "needs_reverification" }],
+      });
+
+      const challengeResponse = await app.request(
+        "https://identity.test/v1/account/wallet/challenges",
+        {
+          body: JSON.stringify({
+            address: migratingWallet.address,
+            chainId: 999,
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(challengeResponse.status).toBe(201);
+      const challenge = (await challengeResponse.json()) as {
+        challengeId: string;
+        message: string;
+      };
+      const verifyResponse = await app.request(
+        "https://identity.test/v1/account/wallet/verify",
+        {
+          body: JSON.stringify({
+            ...challenge,
+            signature: await migratingWallet.signMessage({
+              message: challenge.message,
+            }),
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(verifyResponse.status).toBe(200);
+      const claimsResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/claims/current",
+        { headers: { Cookie: survivor.cookie } },
+      );
+      expect(await claimsResponse.json()).toMatchObject({
+        claims: [{ identities: [{ disposition: "linked" }] }],
+      });
+      expect(
+        await database.db
+          .select()
+          .from(privyMigrationClaim)
+          .where(
+            eq(
+              privyMigrationClaim.privyUserId,
+              "did:privy:legacy-wallet-person",
+            ),
+          ),
+      ).toHaveLength(1);
+    });
+
+    test("links a claimed Privy Solana identity with a fresh SIWS proof", async () => {
+      const survivor = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0x1212121212121212121212121212121212121212121212121212121212121212",
+        ),
+      );
+      const attemptResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/attempts",
+        {
+          headers: { Cookie: survivor.cookie, Origin: config.baseUrl },
+          method: "POST",
+        },
+      );
+      const attempt = (await attemptResponse.json()) as {
+        attemptId: string;
+        csrfToken: string;
+      };
+      const claimResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/claims",
+        {
+          body: JSON.stringify(attempt),
+          headers: {
+            Authorization: "Bearer solana-wallet-bundle-token",
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(claimResponse.status).toBe(201);
+      expect(await claimResponse.json()).toMatchObject({
+        identities: [
+          {
+            chainType: "solana",
+            disposition: "needs_reverification",
+            walletAddress: migratingSolanaWallet.address,
+          },
+        ],
+      });
+
+      const challengeResponse = await app.request(
+        "https://identity.test/v1/account/wallet/challenges",
+        {
+          body: JSON.stringify({
+            address: migratingSolanaWallet.address,
+            family: "solana",
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(challengeResponse.status).toBe(201);
+      const challenge = (await challengeResponse.json()) as {
+        challengeId: string;
+        message: string;
+      };
+      const proofBody = JSON.stringify({
+        ...challenge,
+        signature: migratingSolanaWallet.sign(challenge.message),
+      });
+      const verifyResponse = await app.request(
+        "https://identity.test/v1/account/wallet/verify",
+        {
+          body: proofBody,
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(verifyResponse.status).toBe(200);
+      const replayResponse = await app.request(
+        "https://identity.test/v1/account/wallet/verify",
+        {
+          body: proofBody,
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(replayResponse.status).toBe(403);
+      expect(
+        (await identityMe(database.db, survivor.userId)).credentials,
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            address: migratingSolanaWallet.address,
+            family: "solana",
+            kind: "wallet",
+          }),
+        ]),
+      );
+      const claimsResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/claims/current",
+        { headers: { Cookie: survivor.cookie } },
+      );
+      expect(await claimsResponse.json()).toMatchObject({
+        claims: [{ identities: [{ disposition: "linked" }] }],
+      });
+    });
+
+    test("uses SIWS as an isolated proof and consolidates its Solana subject", async () => {
+      const survivor = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0x1313131313131313131313131313131313131313131313131313131313131313",
+        ),
+      );
+      const sourceWallet = createSolanaWallet();
+      const source = await signInSolanaWallet(app, config, sourceWallet);
+      const proof = await signInSolanaWallet(
+        app,
+        config,
+        sourceWallet,
+        "/api/proof-auth",
+        "peezy-proof.session_token",
+      );
+      const previewResponse = await app.request(
+        "https://identity.test/v1/account-merges/proofs",
+        {
+          headers: {
+            Cookie: `${survivor.cookie}; ${proof.cookie}`,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(previewResponse.status).toBe(201);
+      const preview = (await previewResponse.json()) as { attemptId: string };
+      const commitResponse = await app.request(
+        "https://identity.test/v1/account-merges/commit",
+        {
+          body: JSON.stringify({ attemptId: preview.attemptId }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(commitResponse.status).toBe(200);
+      expect(
+        await database.db
+          .select({ userId: walletPrincipal.userId })
+          .from(walletPrincipal)
+          .where(eq(walletPrincipal.address, sourceWallet.address)),
+      ).toEqual([{ userId: survivor.userId }]);
+      expect(
+        await database.db
+          .select({ status: user.status })
+          .from(user)
+          .where(eq(user.id, source.userId)),
+      ).toEqual([{ status: "merged" }]);
     });
 
     test("creates one hosted wallet identity and refuses it after disablement", async () => {
@@ -1378,4 +1906,103 @@ function responseCookie(response: Response, name: string): string {
     }
   }
   throw new Error(`Expected ${name} cookie`);
+}
+
+async function signInHostedWallet(
+  app: ReturnType<typeof createIdentityApp>,
+  config: IdentityConfig,
+  wallet: {
+    address: `0x${string}`;
+    signMessage(input: { message: string }): Promise<`0x${string}`>;
+  },
+  basePath = "/api/auth",
+  cookieName = "peezy-identity.session_token",
+): Promise<{ cookie: string; userId: string }> {
+  const chainId = 999;
+  const nonceResponse = await app.request(
+    `${config.baseUrl}${basePath}/siwe/nonce`,
+    {
+      body: JSON.stringify({ chainId, walletAddress: wallet.address }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+  );
+  expect(nonceResponse.status).toBe(200);
+  const { nonce } = (await nonceResponse.json()) as { nonce: string };
+  const now = new Date();
+  const message = createSiweMessage({
+    address: wallet.address,
+    chainId,
+    domain: new URL(config.baseUrl).host,
+    expirationTime: new Date(now.getTime() + 10 * 60_000),
+    issuedAt: now,
+    nonce,
+    statement: HOSTED_WALLET_STATEMENT,
+    uri: config.baseUrl,
+    version: "1",
+  });
+  const response = await app.request(
+    `${config.baseUrl}${basePath}/siwe/verify`,
+    {
+      body: JSON.stringify({
+        chainId,
+        message,
+        signature: await wallet.signMessage({ message }),
+        walletAddress: wallet.address,
+      }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+  );
+  expect(response.status).toBe(200);
+  const body = (await response.json()) as { user: { id: string } };
+  return { cookie: responseCookie(response, cookieName), userId: body.user.id };
+}
+
+type TestSolanaWallet = ReturnType<typeof createSolanaWallet>;
+
+function createSolanaWallet() {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const spki = publicKey.export({ format: "der", type: "spki" });
+  return {
+    address: bs58.encode(spki.subarray(-32)),
+    sign: (message: string) =>
+      sign(null, Buffer.from(message, "utf8"), privateKey).toString("base64"),
+  };
+}
+
+async function signInSolanaWallet(
+  app: ReturnType<typeof createIdentityApp>,
+  config: IdentityConfig,
+  wallet: TestSolanaWallet,
+  basePath = "/api/auth",
+  cookieName = "peezy-identity.session_token",
+): Promise<{ cookie: string; userId: string }> {
+  const challengeResponse = await app.request(
+    `${config.baseUrl}${basePath}/siws/challenge`,
+    {
+      body: JSON.stringify({ address: wallet.address }),
+      headers: { "Content-Type": "application/json", Origin: config.baseUrl },
+      method: "POST",
+    },
+  );
+  expect(challengeResponse.status).toBe(200);
+  const challenge = (await challengeResponse.json()) as {
+    challengeId: string;
+    message: string;
+  };
+  const response = await app.request(
+    `${config.baseUrl}${basePath}/siws/verify`,
+    {
+      body: JSON.stringify({
+        ...challenge,
+        signature: wallet.sign(challenge.message),
+      }),
+      headers: { "Content-Type": "application/json", Origin: config.baseUrl },
+      method: "POST",
+    },
+  );
+  expect(response.status).toBe(200);
+  const body = (await response.json()) as { user: { id: string } };
+  return { cookie: responseCookie(response, cookieName), userId: body.user.id };
 }

@@ -77,4 +77,19 @@ describe("identity contracts", () => {
       }),
     ).toThrow("Smart-account credentials must be chain scoped");
   });
+
+  test("preserves case-sensitive Solana wallet addresses", () => {
+    const address = "Vote111111111111111111111111111111111111111";
+    expect(
+      WalletCredentialSchema.parse({
+        accountKind: "eoa",
+        address,
+        family: "solana",
+        id: "715f5baa-cd86-4a98-a1fe-3dd930f5d5d4",
+        kind: "wallet",
+        linkedAt: "2026-07-29T00:00:00.000Z",
+        signInEnabled: true,
+      }).address,
+    ).toBe(address);
+  });
 });

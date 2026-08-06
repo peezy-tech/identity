@@ -22,6 +22,7 @@ import type { IdentityConfig, SocialProviderName } from "./config";
 import type { IdentityDb } from "./db/client";
 import * as schema from "./db/schema";
 import { sessionHandoffPlugin } from "./session-handoffs";
+import { solanaAuthPlugin } from "./solana-auth";
 
 const TELEGRAM_ISSUER = "https://oauth.telegram.org";
 const TELEGRAM_DISCOVERY_URL = `${TELEGRAM_ISSUER}/.well-known/openid-configuration`;
@@ -33,7 +34,25 @@ type TelegramOAuthTokens = {
   idToken?: string | undefined;
 };
 
+type IdentityAuthMode = "primary" | "proof";
+
 export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
+  return createConfiguredIdentityAuth(config, db, "primary");
+}
+
+export function createIdentityProofAuth(
+  config: IdentityConfig,
+  db: IdentityDb,
+) {
+  return createConfiguredIdentityAuth(config, db, "proof").auth;
+}
+
+function createConfiguredIdentityAuth(
+  config: IdentityConfig,
+  db: IdentityDb,
+  mode: IdentityAuthMode,
+) {
+  const proofOnly = mode === "proof";
   const secureCookies = new URL(config.baseUrl).protocol === "https:";
   const socialProviderNames = configuredSocialProviders(config.socialProviders);
   const github = config.socialProviders.github;
@@ -51,6 +70,7 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
                 authentication: "basic",
                 clientId: telegram.clientId,
                 clientSecret: telegram.clientSecret,
+                disableSignUp: proofOnly,
                 discoveryUrl: TELEGRAM_DISCOVERY_URL,
                 getUserInfo: (tokens) =>
                   telegramUserInfo(tokens, telegram.clientId),
@@ -89,11 +109,11 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
 
   const auth = betterAuth({
     appName: "peezy.tech",
-    basePath: "/api/auth",
+    basePath: proofOnly ? "/api/proof-auth" : "/api/auth",
     baseURL: config.baseUrl,
     secret: config.secret,
     trustedOrigins: [config.baseUrl, ...config.trustedOrigins],
-    database: createIdentityDatabaseAdapter(db),
+    database: createIdentityDatabaseAdapter(db, proofOnly),
     user: {
       additionalFields: {
         status: {
@@ -120,6 +140,7 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
       account: {
         create: {
           after: async (createdAccount) => {
+            if (proofOnly) return;
             if (
               !socialProviderNames.includes(
                 createdAccount.providerId as SocialProviderName,
@@ -155,6 +176,7 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
         : {
             discord: {
               ...discord,
+              disableSignUp: proofOnly,
               disableDefaultScope: true,
               mapProfileToUser: (profile) => ({
                 email: socialProviderEmail("discord", profile.id),
@@ -162,12 +184,15 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
               scope: ["identify"],
             },
           }),
-      ...(github === undefined ? {} : { github }),
+      ...(github === undefined
+        ? {}
+        : { github: { ...github, disableSignUp: proofOnly } }),
       ...(apple === undefined
         ? {}
         : {
             apple: {
               ...apple,
+              disableSignUp: proofOnly,
               disableIdTokenSignIn: true,
             },
           }),
@@ -176,6 +201,7 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
         : {
             twitter: {
               ...twitter,
+              disableSignUp: proofOnly,
               disableDefaultScope: true,
               mapProfileToUser: (profile) => ({
                 email: socialProviderEmail("twitter", profile.data.id),
@@ -185,7 +211,7 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
           }),
     },
     advanced: {
-      cookiePrefix: "peezy-identity",
+      cookiePrefix: proofOnly ? "peezy-proof" : "peezy-identity",
       database: { generateId: "uuid" },
       defaultCookieAttributes: {
         sameSite: secureCookies ? "none" : "lax",
@@ -201,11 +227,15 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
     },
     telemetry: { enabled: false },
     plugins: [
-      jwt({
-        jwt: {
-          issuer: `${config.baseUrl}/api/auth`,
-        },
-      }),
+      ...(proofOnly
+        ? []
+        : [
+            jwt({
+              jwt: {
+                issuer: `${config.baseUrl}/api/auth`,
+              },
+            }),
+          ]),
       ...telegramPlugins,
       siwe({
         anonymous: true,
@@ -220,15 +250,15 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
             signature,
           }),
       }),
-      sessionHandoffPlugin(db, config),
-      providerPlugin,
+      solanaAuthPlugin(db, config, mode),
+      ...(proofOnly ? [] : [sessionHandoffPlugin(db, config), providerPlugin]),
     ],
   });
 
   return { auth, socialProviderNames };
 }
 
-function createIdentityDatabaseAdapter(db: IdentityDb) {
+function createIdentityDatabaseAdapter(db: IdentityDb, proofOnly = false) {
   const createAdapter = drizzleAdapter(db, {
     provider: "pg",
     schema,
@@ -238,6 +268,13 @@ function createIdentityDatabaseAdapter(db: IdentityDb) {
     const adapter = createAdapter(...args);
     return {
       ...adapter,
+      create: async (...createArgs: Parameters<typeof adapter.create>) => {
+        const [input] = createArgs;
+        if (proofOnly && input.model === "user") {
+          throw new Error("Proof authentication cannot create an account");
+        }
+        return adapter.create(...createArgs);
+      },
       findOne: async (...findOneArgs: Parameters<typeof adapter.findOne>) => {
         const [input] = findOneArgs;
         const result = await adapter.findOne({
@@ -282,7 +319,7 @@ function isDisabledIdentityUser(value: unknown): boolean {
     typeof value === "object" &&
     value !== null &&
     "status" in value &&
-    value.status === "disabled"
+    value.status !== "active"
   );
 }
 
@@ -335,6 +372,7 @@ async function verifyHostedWalletSignature(
     .where(
       and(
         eq(schema.walletPrincipal.accountKind, "eoa"),
+        eq(schema.walletPrincipal.family, "evm"),
         sql`lower(${schema.walletPrincipal.address}) = lower(${input.address})`,
       ),
     )
@@ -444,3 +482,4 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
 }
 
 export type IdentityAuth = ReturnType<typeof createIdentityAuth>["auth"];
+export type IdentityProofAuth = ReturnType<typeof createIdentityProofAuth>;

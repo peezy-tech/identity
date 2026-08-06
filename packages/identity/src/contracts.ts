@@ -6,6 +6,9 @@ export const EvmAddressSchema = z
   .string()
   .regex(/^0x[a-fA-F0-9]{40}$/)
   .transform((value) => value.toLowerCase() as `0x${string}`);
+export const SolanaAddressSchema = z
+  .string()
+  .regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
 export const HttpUrlSchema = z
   .string()
   .url()
@@ -59,7 +62,7 @@ export const PasskeyCredentialSchema = z.object({
   linkedAt: IsoDateSchema,
 });
 
-export const WalletCredentialSchema = z
+export const EvmWalletCredentialSchema = z
   .object({
     accountKind: z.enum(["eoa", "smart-account"]),
     address: EvmAddressSchema,
@@ -91,7 +94,22 @@ export const WalletCredentialSchema = z
     }
   });
 
-export const IdentityCredentialSchema = z.discriminatedUnion("kind", [
+export const SolanaWalletCredentialSchema = z.object({
+  accountKind: z.literal("eoa"),
+  address: SolanaAddressSchema,
+  family: z.literal("solana"),
+  id: z.string().uuid(),
+  kind: z.literal("wallet"),
+  linkedAt: IsoDateSchema,
+  signInEnabled: z.boolean(),
+});
+
+export const WalletCredentialSchema = z.union([
+  EvmWalletCredentialSchema,
+  SolanaWalletCredentialSchema,
+]);
+
+export const IdentityCredentialSchema = z.union([
   SocialCredentialSchema,
   EmailCredentialSchema,
   PasskeyCredentialSchema,

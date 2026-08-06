@@ -245,6 +245,7 @@ export async function createWalletGrant(input: {
       .where(
         and(
           eq(walletPrincipal.accountKind, "eoa"),
+          eq(walletPrincipal.family, "evm"),
           sql`lower(${walletPrincipal.address}) = ${normalizedAddress}`,
         ),
       )

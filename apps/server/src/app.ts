@@ -11,18 +11,42 @@ import { getIPFromHeader, normalizeIP } from "@better-auth/core/utils/ip";
 import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { getConnInfo } from "hono/bun";
+import { serveStatic } from "hono/bun";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
 import { ZodError } from "zod";
 
-import type { IdentityAuth } from "./auth";
+import type { IdentityAuth, IdentityProofAuth } from "./auth";
+import {
+  AccountMergeError,
+  commitAccountMerge,
+  createAccountMergeAttempt,
+} from "./account-merge";
+import {
+  AccountWalletLinkError,
+  createAccountWalletLinkChallenge,
+  verifyAccountWalletLink,
+} from "./account-wallet-link";
 import { verifySecret } from "./clients";
 import type { IdentityConfig } from "./config";
 import type { IdentityDb } from "./db/client";
-import { appClient } from "./db/schema";
+import { appClient, session } from "./db/schema";
 import { identityMe, IdentityNotFoundError } from "./identity";
-import { consentPage, homePage, linkSocialPage, signInPage } from "./pages";
+import {
+  accountPage,
+  consentPage,
+  homePage,
+  linkSocialPage,
+  signInPage,
+} from "./pages";
+import {
+  claimPrivyMigration,
+  createPrivyMigrationAttempt,
+  listCurrentPrivyClaims,
+  PrivyMigrationError,
+  type PrivyGateway,
+} from "./privy-migration";
 import { consumeRateLimit } from "./rate-limit";
 import { createSocialLinkHandoff } from "./session-handoffs";
 import {
@@ -36,6 +60,8 @@ type AppDependencies = {
   auth: IdentityAuth;
   config: IdentityConfig;
   db: IdentityDb;
+  privyGateway?: PrivyGateway;
+  proofAuth: IdentityProofAuth;
   socialProviderNames: IdentityConfigSocialProvider[];
 };
 
@@ -43,16 +69,30 @@ type IdentityConfigSocialProvider = keyof IdentityConfig["socialProviders"];
 
 export function createIdentityApp(dependencies: AppDependencies): Hono {
   const app = new Hono();
+  const applySecureHeaders = secureHeaders();
   const trustedOrigins = new Set([
     dependencies.config.baseUrl,
     ...dependencies.config.trustedOrigins,
   ]);
 
-  app.use("*", secureHeaders());
+  app.use("*", async (context, next) => {
+    await applySecureHeaders(context, next);
+    if (context.req.path === "/account") {
+      context.header("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
+    }
+  });
   app.use(
     "/v1/*",
     bodyLimit({
       maxSize: 20_000,
+      onError: (context) =>
+        errorResponse(context, 413, "Request body is too large"),
+    }),
+  );
+  app.use(
+    "/api/proof-auth/*",
+    bodyLimit({
+      maxSize: 100_000,
       onError: (context) =>
         errorResponse(context, 413, "Request body is too large"),
     }),
@@ -78,6 +118,32 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
   );
 
   app.get("/", (context) => context.html(homePage()));
+  app.get(
+    "/assets/account-client.js",
+    serveStatic({ path: "./apps/server/dist/public/account-client.js" }),
+  );
+  app.get("/account", async (context) => {
+    const identitySession = await dependencies.auth.api.getSession({
+      headers: context.req.raw.headers,
+    });
+    if (identitySession === null) {
+      return context.redirect("/sign-in?return_to=%2Faccount");
+    }
+    const nonce = crypto.randomUUID().replaceAll("-", "");
+    return context.html(
+      accountPage(
+        {
+          providers: dependencies.socialProviderNames,
+          ...(dependencies.config.privyMigration === undefined
+            ? {}
+            : { privyAppId: dependencies.config.privyMigration.appId }),
+        },
+        nonce,
+      ),
+      200,
+      accountSecurityHeaders(nonce),
+    );
+  });
   app.get("/sign-in", (context) => {
     const nonce = crypto.randomUUID().replaceAll("-", "");
     return context.html(
@@ -163,6 +229,229 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     }
     return context.json(
       await identityMe(dependencies.db, identitySession.user.id),
+    );
+  });
+
+  app.post("/v1/migrations/privy/attempts", async (context) => {
+    requireSameOrigin(context.req.raw, dependencies.config.baseUrl);
+    const identitySession = await requireIdentitySession(
+      dependencies.auth,
+      context.req.raw.headers,
+    );
+    if (
+      dependencies.config.privyMigration === undefined ||
+      dependencies.privyGateway === undefined
+    ) {
+      throw new PrivyMigrationError(
+        404,
+        "migration_unavailable",
+        "Privy migration is not available",
+      );
+    }
+    await requireRateLimit(dependencies.db, {
+      key: `privy-attempt:${identitySession.user.id}`,
+      limit: 20,
+      windowMs: 5 * 60_000,
+    });
+    return context.json(
+      await createPrivyMigrationAttempt(
+        dependencies.db,
+        identitySession.user.id,
+      ),
+      201,
+    );
+  });
+
+  app.post("/v1/migrations/privy/claims", async (context) => {
+    requireSameOrigin(context.req.raw, dependencies.config.baseUrl);
+    const identitySession = await requireIdentitySession(
+      dependencies.auth,
+      context.req.raw.headers,
+    );
+    if (
+      dependencies.config.privyMigration === undefined ||
+      dependencies.privyGateway === undefined
+    ) {
+      throw new PrivyMigrationError(
+        404,
+        "migration_unavailable",
+        "Privy migration is not available",
+      );
+    }
+    const accessToken = bearerToken(context.req.raw);
+    const body = (await boundedJson(context)) as {
+      attemptId?: unknown;
+      csrfToken?: unknown;
+    };
+    if (
+      typeof body.attemptId !== "string" ||
+      typeof body.csrfToken !== "string"
+    ) {
+      throw new PrivyMigrationError(
+        400,
+        "invalid_request",
+        "Migration claim is invalid",
+      );
+    }
+    await requireRateLimit(dependencies.db, {
+      key: `privy-claim:${identitySession.user.id}`,
+      limit: 10,
+      windowMs: 5 * 60_000,
+    });
+    return context.json(
+      await claimPrivyMigration({
+        accessToken,
+        attemptId: body.attemptId,
+        csrfToken: body.csrfToken,
+        db: dependencies.db,
+        gateway: dependencies.privyGateway,
+        userId: identitySession.user.id,
+      }),
+      201,
+    );
+  });
+
+  app.get("/v1/migrations/privy/claims/current", async (context) => {
+    const identitySession = await requireIdentitySession(
+      dependencies.auth,
+      context.req.raw.headers,
+    );
+    return context.json({
+      claims: await listCurrentPrivyClaims(
+        dependencies.db,
+        identitySession.user.id,
+      ),
+    });
+  });
+
+  app.post("/v1/account/wallet/challenges", async (context) => {
+    requireSameOrigin(context.req.raw, dependencies.config.baseUrl);
+    const identitySession = await requireIdentitySession(
+      dependencies.auth,
+      context.req.raw.headers,
+    );
+    const body = (await boundedJson(context)) as {
+      address?: unknown;
+      chainId?: unknown;
+      family?: unknown;
+    };
+    const family = body.family === "solana" ? "solana" : "evm";
+    if (
+      typeof body.address !== "string" ||
+      (family === "evm" && typeof body.chainId !== "number") ||
+      (family === "solana" && body.chainId !== undefined)
+    ) {
+      throw new AccountWalletLinkError(
+        400,
+        "invalid_request",
+        "Wallet link request is invalid",
+      );
+    }
+    await requireRateLimit(dependencies.db, {
+      key: `account-wallet:${identitySession.user.id}`,
+      limit: 20,
+      windowMs: 5 * 60_000,
+    });
+    return context.json(
+      await createAccountWalletLinkChallenge({
+        address: body.address,
+        baseUrl: dependencies.config.baseUrl,
+        ...(typeof body.chainId === "number" ? { chainId: body.chainId } : {}),
+        db: dependencies.db,
+        family,
+        userId: identitySession.user.id,
+      }),
+      201,
+    );
+  });
+
+  app.post("/v1/account/wallet/verify", async (context) => {
+    requireSameOrigin(context.req.raw, dependencies.config.baseUrl);
+    const identitySession = await requireIdentitySession(
+      dependencies.auth,
+      context.req.raw.headers,
+    );
+    const body = (await boundedJson(context)) as {
+      challengeId?: unknown;
+      message?: unknown;
+      signature?: unknown;
+    };
+    if (
+      typeof body.challengeId !== "string" ||
+      typeof body.message !== "string" ||
+      typeof body.signature !== "string"
+    ) {
+      throw new AccountWalletLinkError(
+        400,
+        "invalid_request",
+        "Wallet proof is invalid",
+      );
+    }
+    return context.json(
+      await verifyAccountWalletLink({
+        challengeId: body.challengeId,
+        db: dependencies.db,
+        message: body.message,
+        signature: body.signature,
+        userId: identitySession.user.id,
+      }),
+    );
+  });
+
+  app.post("/v1/account-merges/proofs", async (context) => {
+    requireSameOrigin(context.req.raw, dependencies.config.baseUrl);
+    const primarySession = await requireIdentitySession(
+      dependencies.auth,
+      context.req.raw.headers,
+    );
+    if (!sessionIsRecent(primarySession)) {
+      throw new AccountMergeError(
+        403,
+        "reauth_required",
+        "Sign in again before consolidating accounts",
+      );
+    }
+    const proofSession = await dependencies.proofAuth.api.getSession({
+      headers: context.req.raw.headers,
+    });
+    if (proofSession === null) {
+      throw new AccountMergeError(
+        401,
+        "proof_required",
+        "Authenticate the account you want to consolidate",
+      );
+    }
+    const preview = await createAccountMergeAttempt({
+      db: dependencies.db,
+      sourceUserId: proofSession.user.id,
+      targetUserId: primarySession.user.id,
+    });
+    await dependencies.db
+      .delete(session)
+      .where(eq(session.id, proofSession.session.id));
+    return context.json(preview, 201);
+  });
+
+  app.post("/v1/account-merges/commit", async (context) => {
+    requireSameOrigin(context.req.raw, dependencies.config.baseUrl);
+    const identitySession = await requireIdentitySession(
+      dependencies.auth,
+      context.req.raw.headers,
+    );
+    const body = (await boundedJson(context)) as { attemptId?: unknown };
+    if (typeof body.attemptId !== "string") {
+      throw new AccountMergeError(
+        400,
+        "invalid_request",
+        "Account consolidation request is invalid",
+      );
+    }
+    return context.json(
+      await commitAccountMerge({
+        attemptId: body.attemptId,
+        db: dependencies.db,
+        targetUserId: identitySession.user.id,
+      }),
     );
   });
 
@@ -313,6 +602,12 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
   app.all("/api/auth/*", (context) =>
     dependencies.auth.handler(context.req.raw),
   );
+  app.all("/api/proof-auth", (context) =>
+    dependencies.proofAuth.handler(context.req.raw),
+  );
+  app.all("/api/proof-auth/*", (context) =>
+    dependencies.proofAuth.handler(context.req.raw),
+  );
 
   app.notFound((context) =>
     errorResponse(context, 404, "Identity route was not found"),
@@ -326,6 +621,15 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     }
     if (error instanceof IdentityNotFoundError) {
       return errorResponse(context, 404, error.message);
+    }
+    if (error instanceof PrivyMigrationError) {
+      return errorResponse(context, error.status, error.message, error.code);
+    }
+    if (error instanceof AccountMergeError) {
+      return errorResponse(context, error.status, error.message, error.code);
+    }
+    if (error instanceof AccountWalletLinkError) {
+      return errorResponse(context, error.status, error.message, error.code);
     }
     if (error instanceof RequestError) {
       return errorResponse(context, error.status, error.message);
@@ -441,8 +745,12 @@ function errorResponse(
   context: { json: (body: object, status: number) => Response },
   status: number,
   message: string,
+  code?: string,
 ): Response {
-  return context.json({ error: { message } }, status);
+  return context.json(
+    { error: { ...(code === undefined ? {} : { code }), message } },
+    status,
+  );
 }
 
 function contentSecurityHeaders(nonce: string): Record<string, string> {
@@ -458,4 +766,67 @@ function contentSecurityHeaders(nonce: string): Record<string, string> {
       "style-src 'unsafe-inline'",
     ].join("; "),
   };
+}
+
+function accountSecurityHeaders(nonce: string): Record<string, string> {
+  return {
+    "Content-Security-Policy": [
+      "default-src 'none'",
+      "base-uri 'none'",
+      "child-src https://auth.privy.io https://verify.walletconnect.com https://verify.walletconnect.org",
+      "connect-src 'self' https://auth.privy.io https://*.rpc.privy.systems https://explorer-api.walletconnect.com https://hcaptcha.com https://*.hcaptcha.com wss://relay.walletconnect.com wss://relay.walletconnect.org wss://www.walletlink.org",
+      "font-src 'self'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+      "frame-src https://auth.privy.io https://verify.walletconnect.com https://verify.walletconnect.org https://challenges.cloudflare.com https://hcaptcha.com https://*.hcaptcha.com",
+      "img-src 'self' data: blob: https:",
+      "manifest-src 'self'",
+      "object-src 'none'",
+      `script-src 'self' 'nonce-${nonce}' https://challenges.cloudflare.com https://hcaptcha.com https://*.hcaptcha.com`,
+      "style-src 'self' 'unsafe-inline' https://hcaptcha.com https://*.hcaptcha.com",
+      "worker-src 'self'",
+    ].join("; "),
+    "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
+  };
+}
+
+async function requireIdentitySession(auth: IdentityAuth, headers: Headers) {
+  const identitySession = await auth.api.getSession({ headers });
+  if (identitySession === null) {
+    throw new RequestError(401, "Authentication is required");
+  }
+  return identitySession;
+}
+
+function sessionIsRecent(identitySession: {
+  session: { createdAt: Date | string };
+}): boolean {
+  const createdAt = new Date(identitySession.session.createdAt).getTime();
+  return Number.isFinite(createdAt) && createdAt >= Date.now() - 10 * 60_000;
+}
+
+function requireSameOrigin(request: Request, baseUrl: string): void {
+  if (requiredOrigin(request) !== new URL(baseUrl).origin) {
+    throw new RequestError(403, "Request origin is not allowed");
+  }
+}
+
+function bearerToken(request: Request): string {
+  const authorization = request.headers.get("authorization");
+  if (authorization === null || !authorization.startsWith("Bearer ")) {
+    throw new PrivyMigrationError(
+      401,
+      "invalid_proof",
+      "Privy authentication is required",
+    );
+  }
+  const token = authorization.slice(7).trim();
+  if (token.length === 0 || token.length > 16_384) {
+    throw new PrivyMigrationError(
+      401,
+      "invalid_proof",
+      "Privy authentication is invalid",
+    );
+  }
+  return token;
 }
