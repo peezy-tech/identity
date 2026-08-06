@@ -37,6 +37,7 @@ import { HOSTED_WALLET_STATEMENT } from "../src/constants";
 import { createDbClient, type IdentityDbClient } from "../src/db/client";
 import {
   account,
+  accountWalletLinkChallenge,
   identitySubjectMerge,
   privyMigrationClaim,
   privyMigrationIdentity,
@@ -448,6 +449,14 @@ if (databaseUrl === undefined) {
         "0x9999999999999999999999999999999999999999999999999999999999999999",
       );
       const survivor = await signInHostedWallet(app, config, survivorWallet);
+      const accountResponse = await app.request(
+        "https://identity.test/account",
+        { headers: { Cookie: survivor.cookie } },
+      );
+      expect(accountResponse.status).toBe(200);
+      expect(accountResponse.headers.get("content-security-policy")).toContain(
+        "https://rpc.walletconnect.org",
+      );
       const attemptResponse = await app.request(
         "https://identity.test/v1/migrations/privy/attempts",
         {
@@ -515,9 +524,35 @@ if (databaseUrl === undefined) {
         },
       );
       expect(verifyResponse.status).toBe(200);
+      const crossOriginClaimsResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/claims/current",
+        {
+          headers: {
+            Cookie: survivor.cookie,
+            Origin: "https://evil.test",
+          },
+        },
+      );
+      expect(crossOriginClaimsResponse.status).toBe(403);
+      const [pendingWalletIdentity] = await database.db
+        .select({ disposition: privyMigrationIdentity.disposition })
+        .from(privyMigrationIdentity)
+        .where(
+          eq(
+            privyMigrationIdentity.walletAddress,
+            migratingWallet.address.toLowerCase(),
+          ),
+        )
+        .limit(1);
+      expect(pendingWalletIdentity?.disposition).toBe("needs_reverification");
       const claimsResponse = await app.request(
         "https://identity.test/v1/migrations/privy/claims/current",
-        { headers: { Cookie: survivor.cookie } },
+        {
+          headers: {
+            Cookie: survivor.cookie,
+            "Sec-Fetch-Site": "same-origin",
+          },
+        },
       );
       expect(await claimsResponse.json()).toMatchObject({
         claims: [{ identities: [{ disposition: "linked" }] }],
@@ -641,11 +676,69 @@ if (databaseUrl === undefined) {
       );
       const claimsResponse = await app.request(
         "https://identity.test/v1/migrations/privy/claims/current",
-        { headers: { Cookie: survivor.cookie } },
+        { headers: { Cookie: survivor.cookie, Origin: config.baseUrl } },
       );
       expect(await claimsResponse.json()).toMatchObject({
         claims: [{ identities: [{ disposition: "linked" }] }],
       });
+    });
+
+    test("invalidates and throttles failed account wallet proofs", async () => {
+      const wallet = privateKeyToAccount(
+        "0x1414141414141414141414141414141414141414141414141414141414141414",
+      );
+      const signedIn = await signInHostedWallet(app, config, wallet);
+      const challengeResponse = await app.request(
+        "https://identity.test/v1/account/wallet/challenges",
+        {
+          body: JSON.stringify({ address: wallet.address, chainId: 999 }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: signedIn.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(challengeResponse.status).toBe(201);
+      const challenge = (await challengeResponse.json()) as {
+        challengeId: string;
+        message: string;
+      };
+      const verify = (signature: string) =>
+        app.request("https://identity.test/v1/account/wallet/verify", {
+          body: JSON.stringify({ ...challenge, signature }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: signedIn.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        });
+
+      expect((await verify("0x00")).status).toBe(401);
+      const [failedChallenge] = await database.db
+        .select({ usedAt: accountWalletLinkChallenge.usedAt })
+        .from(accountWalletLinkChallenge)
+        .where(eq(accountWalletLinkChallenge.id, challenge.challengeId));
+      expect(failedChallenge?.usedAt).toBeInstanceOf(Date);
+      expect(
+        (await verify(await wallet.signMessage({ message: challenge.message })))
+          .status,
+      ).toBe(403);
+
+      const rateLimitKey = `identity-v1:account-wallet-verify:${signedIn.userId}`;
+      await database.db
+        .insert(rateLimit)
+        .values({ count: 10, key: rateLimitKey, lastRequest: Date.now() })
+        .onConflictDoUpdate({
+          set: { count: 10, lastRequest: Date.now() },
+          target: rateLimit.key,
+        });
+      expect((await verify("0x00")).status).toBe(429);
+      await database.db
+        .delete(rateLimit)
+        .where(eq(rateLimit.key, rateLimitKey));
     });
 
     test("uses SIWS as an isolated proof and consolidates its Solana subject", async () => {

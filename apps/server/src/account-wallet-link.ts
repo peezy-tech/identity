@@ -159,6 +159,16 @@ export async function verifyAccountWalletLink(input: {
     }
   }
   if (!valid) {
+    await input.db
+      .update(accountWalletLinkChallenge)
+      .set({ usedAt: new Date() })
+      .where(
+        and(
+          eq(accountWalletLinkChallenge.id, challenge.id),
+          isNull(accountWalletLinkChallenge.usedAt),
+          gt(accountWalletLinkChallenge.expiresAt, new Date()),
+        ),
+      );
     throw new AccountWalletLinkError(
       401,
       "invalid_signature",

@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+
 import {
   IdentityCapabilitiesSchema,
   IdentitySubjectSchema,
@@ -120,7 +122,10 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
   app.get("/", (context) => context.html(homePage()));
   app.get(
     "/assets/account-client.js",
-    serveStatic({ path: "./apps/server/dist/public/account-client.js" }),
+    serveStatic({
+      path: resolve(import.meta.dir, "../dist/public/account-client.js"),
+      root: "/",
+    }),
   );
   app.get("/account", async (context) => {
     const identitySession = await dependencies.auth.api.getSession({
@@ -312,6 +317,7 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
   });
 
   app.get("/v1/migrations/privy/claims/current", async (context) => {
+    requireSameOrigin(context.req.raw, dependencies.config.baseUrl);
     const identitySession = await requireIdentitySession(
       dependencies.auth,
       context.req.raw.headers,
@@ -387,6 +393,11 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
         "Wallet proof is invalid",
       );
     }
+    await requireRateLimit(dependencies.db, {
+      key: `account-wallet-verify:${identitySession.user.id}`,
+      limit: 10,
+      windowMs: 5 * 60_000,
+    });
     return context.json(
       await verifyAccountWalletLink({
         challengeId: body.challengeId,
@@ -774,7 +785,7 @@ function accountSecurityHeaders(nonce: string): Record<string, string> {
       "default-src 'none'",
       "base-uri 'none'",
       "child-src https://auth.privy.io https://verify.walletconnect.com https://verify.walletconnect.org",
-      "connect-src 'self' https://auth.privy.io https://*.rpc.privy.systems https://explorer-api.walletconnect.com https://hcaptcha.com https://*.hcaptcha.com wss://relay.walletconnect.com wss://relay.walletconnect.org wss://www.walletlink.org",
+      "connect-src 'self' https://auth.privy.io https://*.rpc.privy.systems https://explorer-api.walletconnect.com https://rpc.walletconnect.org https://hcaptcha.com https://*.hcaptcha.com wss://relay.walletconnect.com wss://relay.walletconnect.org wss://www.walletlink.org",
       "font-src 'self'",
       "form-action 'self'",
       "frame-ancestors 'none'",
@@ -806,9 +817,28 @@ function sessionIsRecent(identitySession: {
 }
 
 function requireSameOrigin(request: Request, baseUrl: string): void {
-  if (requiredOrigin(request) !== new URL(baseUrl).origin) {
+  const expectedOrigin = new URL(baseUrl).origin;
+  const origin = request.headers.get("origin");
+  if (origin !== null) {
+    if (requiredOrigin(request) !== expectedOrigin) {
+      throw new RequestError(403, "Request origin is not allowed");
+    }
+    return;
+  }
+  const fetchSite = request.headers.get("sec-fetch-site");
+  if (fetchSite !== null) {
+    if (fetchSite === "same-origin") return;
     throw new RequestError(403, "Request origin is not allowed");
   }
+  const referer = request.headers.get("referer");
+  if (referer !== null) {
+    try {
+      if (new URL(referer).origin === expectedOrigin) return;
+    } catch {
+      // Invalid referrers are not same-origin proof.
+    }
+  }
+  throw new RequestError(403, "Request origin is not allowed");
 }
 
 function bearerToken(request: Request): string {
