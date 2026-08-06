@@ -444,11 +444,65 @@ if (databaseUrl === undefined) {
       );
     });
 
+    test("requires a recent proof-auth session before preparing consolidation", async () => {
+      const survivor = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0x1717171717171717171717171717171717171717171717171717171717171717",
+        ),
+      );
+      const source = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0x1818181818181818181818181818181818181818181818181818181818181818",
+        ),
+      );
+      const proof = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0x1818181818181818181818181818181818181818181818181818181818181818",
+        ),
+        "/api/proof-auth",
+        "peezy-proof.session_token",
+      );
+      await database.db
+        .update(session)
+        .set({ createdAt: new Date(Date.now() - 11 * 60_000) })
+        .where(eq(session.userId, source.userId));
+
+      const response = await app.request(
+        "https://identity.test/v1/account-merges/proofs",
+        {
+          headers: {
+            Cookie: `${survivor.cookie}; ${proof.cookie}`,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({
+        error: { code: "reauth_required" },
+      });
+    });
+
     test("keeps a claimed parent while a wallet identity independently transitions to linked", async () => {
       const survivorWallet = privateKeyToAccount(
         "0x9999999999999999999999999999999999999999999999999999999999999999",
       );
       const survivor = await signInHostedWallet(app, config, survivorWallet);
+      await database.db.insert(walletPrincipal).values({
+        accountKind: "smart-account",
+        address: migratingWallet.address,
+        chainId: 1,
+        family: "evm",
+        id: crypto.randomUUID(),
+        signInEnabled: true,
+        userId: survivor.userId,
+      });
       const accountResponse = await app.request(
         "https://identity.test/account",
         { headers: { Cookie: survivor.cookie } },

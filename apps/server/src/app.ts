@@ -432,6 +432,13 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
         "Authenticate the account you want to consolidate",
       );
     }
+    if (!sessionIsRecent(proofSession)) {
+      throw new AccountMergeError(
+        403,
+        "reauth_required",
+        "Sign in again before consolidating accounts",
+      );
+    }
     const preview = await createAccountMergeAttempt({
       db: dependencies.db,
       sourceUserId: proofSession.user.id,

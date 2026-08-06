@@ -549,6 +549,7 @@ async function resolveDisposition(
       .from(walletPrincipal)
       .where(
         and(
+          eq(walletPrincipal.accountKind, "eoa"),
           eq(walletPrincipal.family, "evm"),
           sql`lower(${walletPrincipal.address}) = ${identity.walletAddress.toLowerCase()}`,
         ),
