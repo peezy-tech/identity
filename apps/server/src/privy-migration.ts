@@ -490,6 +490,7 @@ export function normalizePrivyIdentities(
       "chain_type",
       "chain",
     ])?.toLowerCase();
+    const smartWallet = type === "smart_wallet";
     const wallet = type.includes("wallet") && address !== undefined;
     const provider = SUPPORTED_SOCIAL_TYPES[type];
     const verifiedAt = firstNumberField(linkedAccount, [
@@ -512,11 +513,12 @@ export function normalizePrivyIdentities(
         ? {
             walletAddress:
               chainType === "solana" ? address : address.toLowerCase(),
-            walletType:
-              firstStringField(linkedAccount, [
-                "wallet_client_type",
-                "connector_type",
-              ]) ?? (type.includes("embedded") ? "embedded" : "external"),
+            walletType: smartWallet
+              ? "smart-account"
+              : (firstStringField(linkedAccount, [
+                  "wallet_client_type",
+                  "connector_type",
+                ]) ?? (type.includes("embedded") ? "embedded" : "external")),
           }
         : {}),
     });
@@ -537,6 +539,12 @@ async function resolveDisposition(
   disposition: PrivyIdentityDisposition;
   targetCredentialId?: string;
 }> {
+  // Privy smart_wallet records omit chain_type. Until a chain-scoped
+  // smart-account proof path exists, retain them as legacy-only rather than
+  // inferring an EVM EOA credential from the address.
+  if (identity.type === "smart_wallet") {
+    return { disposition: "legacy_only" };
+  }
   if (
     identity.walletAddress !== undefined &&
     (identity.chainType === undefined ||

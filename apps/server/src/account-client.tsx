@@ -11,6 +11,8 @@ import {
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 
+import { selectEthereumAccount } from "./account-client-wallet";
+
 type Provider = "apple" | "discord" | "github" | "telegram" | "twitter";
 type AccountConfig = { privyAppId: string | null; providers: Provider[] };
 type Credential = {
@@ -163,11 +165,14 @@ function AccountApp() {
     const accounts = (await walletProvider.request({
       method: "eth_requestAccounts",
     })) as string[];
-    const address =
-      accounts.find(
-        (item) => item.toLowerCase() === addressHint?.toLowerCase(),
-      ) ?? accounts[0];
-    if (!address) throw new Error("No wallet account was selected");
+    const address = selectEthereumAccount(accounts, addressHint);
+    if (!address) {
+      throw new Error(
+        addressHint === undefined
+          ? "No wallet account was selected"
+          : "Select the wallet attached to this Privy identity",
+      );
+    }
     const chainHex = (await walletProvider.request({
       method: "eth_chainId",
     })) as string;
@@ -552,6 +557,14 @@ function PrivyMigration(props: {
       return;
     }
     if (!item.walletAddress) return;
+    if (item.type === "smart_wallet") {
+      props.showError(
+        new Error(
+          "Privy smart-wallet migration requires a chain-scoped proof and is not available yet",
+        ),
+      );
+      return;
+    }
     props.setBusy(item.id);
     if (item.chainType === "solana") {
       const privyWallet = solanaWallets.find(
@@ -567,11 +580,16 @@ function PrivyMigration(props: {
       (wallet) =>
         wallet.address.toLowerCase() === item.walletAddress?.toLowerCase(),
     );
+    if (privyWallet === undefined) {
+      props.showError(
+        new Error("Connect the Privy wallet attached to this identity"),
+      );
+      props.setBusy(null);
+      return;
+    }
     (async () => {
       const provider =
-        privyWallet === undefined
-          ? undefined
-          : ((await privyWallet.getEthereumProvider()) as EthereumProvider);
+        (await privyWallet.getEthereumProvider()) as EthereumProvider;
       await props.linkWallet(item.walletAddress, provider);
     })()
       .catch(props.showError)

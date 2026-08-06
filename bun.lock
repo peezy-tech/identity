@@ -47,6 +47,7 @@
       "name": "@peezy.tech/identity",
       "version": "0.1.0",
       "dependencies": {
+        "bs58": "6.0.0",
         "zod": "4.4.3",
       },
       "devDependencies": {

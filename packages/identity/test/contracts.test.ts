@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   IdentityMeResponseSchema,
   PeezyUserSchema,
+  SolanaAddressSchema,
   WalletCredentialSchema,
 } from "../src/contracts";
 
@@ -91,5 +92,9 @@ describe("identity contracts", () => {
         signInEnabled: true,
       }).address,
     ).toBe(address);
+  });
+
+  test("rejects base58 strings that are not 32-byte public keys", () => {
+    expect(SolanaAddressSchema.safeParse("A".repeat(32)).success).toBe(false);
   });
 });

@@ -66,4 +66,21 @@ describe("Privy migration identity normalization", () => {
       new Set(["same-subject", "other-subject"]),
     );
   });
+
+  test("keeps smart wallets chain-unscoped and marks them as smart accounts", () => {
+    const [identity] = normalizePrivyIdentities([
+      {
+        address: "0x4000000000000000000000000000000000000000",
+        smart_wallet_type: "kernel",
+        type: "smart_wallet",
+      },
+    ]);
+
+    expect(identity).toMatchObject({
+      type: "smart_wallet",
+      walletAddress: "0x4000000000000000000000000000000000000000",
+      walletType: "smart-account",
+    });
+    expect(identity?.chainType).toBeUndefined();
+  });
 });

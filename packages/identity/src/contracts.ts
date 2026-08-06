@@ -1,3 +1,4 @@
+import bs58 from "bs58";
 import { z } from "zod";
 
 export const IdentitySubjectSchema = z.string().uuid();
@@ -8,7 +9,15 @@ export const EvmAddressSchema = z
   .transform((value) => value.toLowerCase() as `0x${string}`);
 export const SolanaAddressSchema = z
   .string()
-  .regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
+  .regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)
+  .refine((value) => {
+    try {
+      const bytes = bs58.decode(value);
+      return bytes.length === 32 && bs58.encode(bytes) === value;
+    } catch {
+      return false;
+    }
+  }, "Expected a canonical Solana address");
 export const HttpUrlSchema = z
   .string()
   .url()
