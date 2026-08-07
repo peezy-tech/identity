@@ -29,6 +29,7 @@ import {
   validateLegacyIdentity,
   verifyImport,
 } from "../scripts/import-pledge-cash";
+import { commitAccountMerge } from "../src/account-merge";
 import { createIdentityApp } from "../src/app";
 import { createIdentityAuth, createIdentityProofAuth } from "../src/auth";
 import { seedConfiguredClients } from "../src/clients";
@@ -45,12 +46,15 @@ import {
   session,
   user,
   walletAddress,
+  walletChallenge,
+  walletGrant,
   walletPrincipal,
 } from "../src/db/schema";
 import { identityMe } from "../src/identity";
 import { PrivyMigrationError, type PrivyGateway } from "../src/privy-migration";
 import { MAX_RATE_LIMIT_WINDOW_MS, consumeRateLimit } from "../src/rate-limit";
 import { consumeSessionHandoff } from "../src/session-handoffs";
+import { createWalletGrant } from "../src/wallet-grants";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -1602,6 +1606,227 @@ if (databaseUrl === undefined) {
       expect(disabledIssueResponse.status).toBe(403);
     });
 
+    test("serializes wallet grant issuance with account consolidation challenge revocation", async () => {
+      const sourceSubject = crypto.randomUUID();
+      const targetSubject = crypto.randomUUID();
+      const attemptId = crypto.randomUUID();
+      const principalId = crypto.randomUUID();
+      const raceWallet = privateKeyToAccount(
+        "0x1515151515151515151515151515151515151515151515151515151515151515",
+      );
+      const now = new Date("2026-08-07T00:00:00.000Z");
+      await database.db.insert(user).values([
+        {
+          createdAt: now,
+          email: `${sourceSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: sourceSubject,
+          name: "Grant Merge Source",
+          status: "active",
+          updatedAt: now,
+        },
+        {
+          createdAt: now,
+          email: `${targetSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: targetSubject,
+          name: "Grant Merge Target",
+          status: "active",
+          updatedAt: now,
+        },
+      ]);
+      await database.db.insert(walletPrincipal).values({
+        accountKind: "eoa",
+        address: raceWallet.address,
+        createdAt: now,
+        family: "evm",
+        id: principalId,
+        signInEnabled: true,
+        updatedAt: now,
+        userId: sourceSubject,
+      });
+      await database.db.insert(identitySubjectMerge).values({
+        actorUserId: targetSubject,
+        expiresAt: new Date(Date.now() + 60_000),
+        id: attemptId,
+        metadata: {},
+        sourceUserId: sourceSubject,
+        status: "prepared",
+        targetUserId: targetSubject,
+      });
+      const challengeResponse = await app.request(
+        "https://identity.test/v1/wallet/challenges",
+        {
+          body: JSON.stringify({
+            chainId: 999,
+            clientId: "pledge-cash",
+            purpose: "link",
+            walletAddress: raceWallet.address,
+          }),
+          headers: { "Content-Type": "application/json", Origin: origin },
+          method: "POST",
+        },
+      );
+      expect(challengeResponse.status).toBe(201);
+      const challenge = WalletChallengeResponseSchema.parse(
+        await challengeResponse.json(),
+      );
+      const signature = await raceWallet.signMessage({
+        message: challenge.message,
+      });
+
+      await database.sql`
+        CREATE FUNCTION test_delay_wallet_principal_update()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          PERFORM pg_sleep(0.5);
+          RETURN NEW;
+        END
+        $$
+      `;
+      await database.sql`
+        CREATE TRIGGER test_delay_wallet_principal_update
+        BEFORE UPDATE ON wallet_principal
+        FOR EACH ROW
+        EXECUTE FUNCTION test_delay_wallet_principal_update()
+      `;
+      try {
+        const mergePromise = commitAccountMerge({
+          attemptId,
+          db: database.db,
+          targetUserId: targetSubject,
+        });
+        let issuePromise: ReturnType<typeof createWalletGrant> | undefined;
+        let synchronizationFailure: unknown;
+        try {
+          const mergePid = await waitForDatabaseWaitEvent({
+            event: "PgSleep",
+            sqlClient: database.sql,
+          });
+          issuePromise = createWalletGrant({
+            clientId: "pledge-cash",
+            db: database.db,
+            message: challenge.message,
+            sessionSubject: sourceSubject,
+            signature,
+          });
+          await waitForBlockedBackend({
+            blockerPid: mergePid,
+            sqlClient: database.sql,
+          });
+        } catch (error) {
+          synchronizationFailure = error;
+        }
+        if (synchronizationFailure !== undefined) {
+          await Promise.allSettled([
+            mergePromise,
+            ...(issuePromise === undefined ? [] : [issuePromise]),
+          ]);
+          throw synchronizationFailure;
+        }
+        if (issuePromise === undefined) {
+          throw new Error("Wallet grant issuance was not started");
+        }
+
+        await expect(mergePromise).resolves.toEqual({ merged: true });
+        await expect(issuePromise).rejects.toMatchObject({
+          message: "Identity account is unavailable",
+          status: 403,
+        });
+        expect(
+          await database.db
+            .select({ id: walletPrincipal.id, userId: walletPrincipal.userId })
+            .from(walletPrincipal)
+            .where(eq(walletPrincipal.id, principalId)),
+        ).toEqual([{ id: principalId, userId: targetSubject }]);
+        expect(
+          await database.db
+            .select({ nonce: walletChallenge.nonce })
+            .from(walletChallenge)
+            .where(eq(walletChallenge.nonce, challenge.nonce)),
+        ).toHaveLength(0);
+        expect(
+          await database.db
+            .select({ id: walletGrant.id })
+            .from(walletGrant)
+            .where(eq(walletGrant.userId, sourceSubject)),
+        ).toHaveLength(0);
+        expect(
+          await database.db
+            .select({ status: user.status })
+            .from(user)
+            .where(eq(user.id, sourceSubject)),
+        ).toEqual([{ status: "merged" }]);
+      } finally {
+        await database.sql`
+          DROP TRIGGER IF EXISTS test_delay_wallet_principal_update
+          ON wallet_principal
+        `;
+        await database.sql`
+          DROP FUNCTION IF EXISTS test_delay_wallet_principal_update()
+        `;
+      }
+    });
+
+    test("refuses to exchange a grant after its subject is disabled", async () => {
+      const disabledSubject = crypto.randomUUID();
+      const disabledWallet = privateKeyToAccount(
+        "0x1616161616161616161616161616161616161616161616161616161616161616",
+      );
+      const now = new Date("2026-08-07T00:01:00.000Z");
+      await database.db.insert(user).values({
+        createdAt: now,
+        email: "disabled-grant@example.com",
+        emailVerified: true,
+        id: disabledSubject,
+        name: "Disabled Grant",
+        status: "active",
+        updatedAt: now,
+      });
+      const issueResponse = await issueWalletLinkGrant({
+        app,
+        appSecret,
+        origin,
+        subject: disabledSubject,
+        wallet: disabledWallet,
+      });
+      expect(issueResponse.status).toBe(201);
+      const issued = WalletGrantResponseSchema.parse(
+        await issueResponse.json(),
+      );
+
+      await database.db
+        .update(user)
+        .set({ status: "disabled", updatedAt: new Date() })
+        .where(eq(user.id, disabledSubject));
+      const exchangeResponse = await app.request(
+        "https://identity.test/v1/wallet/grants/exchange",
+        {
+          body: JSON.stringify({
+            clientId: "pledge-cash",
+            grant: issued.grant,
+          }),
+          headers: {
+            Authorization: basic("pledge-cash", appSecret),
+            "Content-Type": "application/json",
+          },
+          method: "POST",
+        },
+      );
+      expect(exchangeResponse.status).toBe(401);
+      expect(await exchangeResponse.json()).toMatchObject({
+        error: { message: "Wallet grant is invalid or expired" },
+      });
+      expect(
+        await database.db
+          .select({ consumedAt: walletGrant.consumedAt })
+          .from(walletGrant)
+          .where(eq(walletGrant.userId, disabledSubject)),
+      ).toEqual([{ consumedAt: null }]);
+    });
+
     test("keeps ambient sign-in separate and requires an explicit authenticated link", async () => {
       const ambientSignInWallet = privateKeyToAccount(
         "0x2222222222222222222222222222222222222222222222222222222222222222",
@@ -2066,6 +2291,94 @@ function bunServer(address: string): {
       port: 443,
     }),
   };
+}
+
+async function issueWalletLinkGrant(input: {
+  app: ReturnType<typeof createIdentityApp>;
+  appSecret: string;
+  origin: string;
+  subject: string;
+  wallet: {
+    address: `0x${string}`;
+    signMessage(input: { message: string }): Promise<`0x${string}`>;
+  };
+}): Promise<Response> {
+  const challengeResponse = await input.app.request(
+    "https://identity.test/v1/wallet/challenges",
+    {
+      body: JSON.stringify({
+        chainId: 999,
+        clientId: "pledge-cash",
+        purpose: "link",
+        walletAddress: input.wallet.address,
+      }),
+      headers: {
+        "Content-Type": "application/json",
+        Origin: input.origin,
+      },
+      method: "POST",
+    },
+  );
+  expect(challengeResponse.status).toBe(201);
+  const challenge = WalletChallengeResponseSchema.parse(
+    await challengeResponse.json(),
+  );
+  return input.app.request("https://identity.test/v1/wallet/grants/issue", {
+    body: JSON.stringify({
+      clientId: "pledge-cash",
+      message: challenge.message,
+      signature: await input.wallet.signMessage({
+        message: challenge.message,
+      }),
+      subject: input.subject,
+    }),
+    headers: {
+      Authorization: basic("pledge-cash", input.appSecret),
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+}
+
+async function waitForBlockedBackend(input: {
+  blockerPid: number;
+  sqlClient: ReturnType<typeof postgres>;
+}): Promise<number> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    const [activity] = await input.sqlClient<{ pid: number }[]>`
+      SELECT pid
+      FROM pg_stat_activity
+      WHERE pid <> pg_backend_pid()
+        AND datname = current_database()
+        AND wait_event_type = 'Lock'
+        AND ${input.blockerPid} = ANY(pg_blocking_pids(pid))
+      LIMIT 1
+    `;
+    if (activity !== undefined) return activity.pid;
+    await Bun.sleep(5);
+  }
+  throw new Error(`No database backend waited for blocker ${input.blockerPid}`);
+}
+
+async function waitForDatabaseWaitEvent(input: {
+  event: string;
+  sqlClient: ReturnType<typeof postgres>;
+}): Promise<number> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    const [activity] = await input.sqlClient<{ pid: number }[]>`
+      SELECT pid
+      FROM pg_stat_activity
+      WHERE pid <> pg_backend_pid()
+        AND datname = current_database()
+        AND wait_event = ${input.event}
+      LIMIT 1
+    `;
+    if (activity !== undefined) return activity.pid;
+    await Bun.sleep(5);
+  }
+  throw new Error(`No database backend entered ${input.event}`);
 }
 
 async function authorizeCode(input: {

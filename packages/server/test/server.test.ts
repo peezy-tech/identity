@@ -76,6 +76,112 @@ describe("identity server helpers", () => {
     }
   });
 
+  test("fails closed when access-token introspection exceeds its deadline", async () => {
+    const { privateKey, publicKey } = await generateKeyPair("RS256");
+    const keyId = "identity-timeout-test-key";
+    const subject = "9bb64f50-80eb-48e3-999e-c4712e752461";
+    const audience = "https://api.identity.test";
+    const server = Bun.serve({
+      fetch: async () =>
+        Response.json({
+          keys: [
+            {
+              ...(await exportJWK(publicKey)),
+              alg: "RS256",
+              kid: keyId,
+              use: "sig",
+            },
+          ],
+        }),
+      port: 0,
+    });
+    const issuer = `${server.url.origin}/api/auth`;
+    const token = await new SignJWT({})
+      .setProtectedHeader({ alg: "RS256", kid: keyId })
+      .setAudience(audience)
+      .setExpirationTime("10 minutes")
+      .setIssuer(issuer)
+      .setSubject(subject)
+      .setIssuedAt()
+      .sign(privateKey);
+
+    try {
+      let requestAborted = false;
+      const requestVerifier = createAccessTokenVerifier({
+        audience,
+        issuer,
+        introspection: {
+          clientId: "identity-test",
+          clientSecret: "identity-secret",
+          fetcher: async (_input, init) => {
+            init?.signal?.addEventListener("abort", () => {
+              requestAborted = true;
+            });
+            return await new Promise<Response>(() => {});
+          },
+          timeoutMs: 20,
+        },
+        jwksUrl: `${server.url.origin}/jwks`,
+      });
+      await expect(requestVerifier(token)).rejects.toThrow(
+        "Identity access token introspection timed out",
+      );
+      expect(requestAborted).toBe(true);
+
+      let bodyAborted = false;
+      const bodyVerifier = createAccessTokenVerifier({
+        audience,
+        issuer,
+        introspection: {
+          clientId: "identity-test",
+          clientSecret: "identity-secret",
+          fetcher: async (_input, init) => {
+            init?.signal?.addEventListener("abort", () => {
+              bodyAborted = true;
+            });
+            return {
+              ok: true,
+              text: async () => await new Promise<string>(() => {}),
+            } as Response;
+          },
+          timeoutMs: 20,
+        },
+        jwksUrl: `${server.url.origin}/jwks`,
+      });
+      await expect(bodyVerifier(token)).rejects.toThrow(
+        "Identity access token introspection timed out",
+      );
+      expect(bodyAborted).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("rejects introspection deadlines that overflow JavaScript timers", () => {
+    const options = {
+      audience: "https://api.identity.test",
+      issuer: "https://identity.test/api/auth",
+      introspection: {
+        clientId: "identity-test",
+        clientSecret: "identity-secret",
+        timeoutMs: 2_147_483_647,
+      },
+    };
+
+    expect(() => createAccessTokenVerifier(options)).not.toThrow();
+    expect(() =>
+      createAccessTokenVerifier({
+        ...options,
+        introspection: {
+          ...options.introspection,
+          timeoutMs: 2_147_483_648,
+        },
+      }),
+    ).toThrow(
+      "Identity introspection timeout must be positive and no greater than 2147483647 milliseconds",
+    );
+  });
+
   test("accepts exactly one bearer token", () => {
     expect(bearerToken("Bearer token-value")).toBe("token-value");
     expect(() => bearerToken("Basic value")).toThrow(
