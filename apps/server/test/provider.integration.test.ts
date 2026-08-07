@@ -51,7 +51,12 @@ import {
   walletPrincipal,
 } from "../src/db/schema";
 import { identityMe } from "../src/identity";
-import { PrivyMigrationError, type PrivyGateway } from "../src/privy-migration";
+import {
+  claimPrivyMigration,
+  createPrivyMigrationAttempt,
+  PrivyMigrationError,
+  type PrivyGateway,
+} from "../src/privy-migration";
 import { MAX_RATE_LIMIT_WINDOW_MS, consumeRateLimit } from "../src/rate-limit";
 import { consumeSessionHandoff } from "../src/session-handoffs";
 import { createWalletGrant } from "../src/wallet-grants";
@@ -410,6 +415,307 @@ if (databaseUrl === undefined) {
             eq(privyMigrationClaim.privyUserId, "did:privy:concurrent-person"),
           ),
       ).toHaveLength(1);
+    });
+
+    test("moves a Privy claim when the claim lifecycle lock precedes account consolidation", async () => {
+      const sourceSubject = crypto.randomUUID();
+      const targetSubject = crypto.randomUUID();
+      const mergeAttemptId = crypto.randomUUID();
+      const privyUserId = `did:privy:${crypto.randomUUID()}`;
+      const now = new Date("2026-08-07T00:00:00.000Z");
+      await database.db.insert(user).values([
+        {
+          createdAt: now,
+          email: `${sourceSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: sourceSubject,
+          name: "Privy Claim Merge Source",
+          status: "active",
+          updatedAt: now,
+        },
+        {
+          createdAt: now,
+          email: `${targetSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: targetSubject,
+          name: "Privy Claim Merge Target",
+          status: "active",
+          updatedAt: now,
+        },
+      ]);
+      await database.db.insert(identitySubjectMerge).values({
+        actorUserId: targetSubject,
+        expiresAt: new Date(Date.now() + 60_000),
+        id: mergeAttemptId,
+        metadata: {},
+        sourceUserId: sourceSubject,
+        status: "prepared",
+        targetUserId: targetSubject,
+      });
+      const migrationAttempt = await createPrivyMigrationAttempt(
+        database.db,
+        sourceSubject,
+      );
+      const raceGateway: PrivyGateway = {
+        async authenticateAccessToken() {
+          return {
+            createdAt: now,
+            id: privyUserId,
+            linkedAccounts: [],
+          };
+        },
+      };
+      let signalClaimCommitted: () => void = () => undefined;
+      const claimCommitted = new Promise<void>((resolve) => {
+        signalClaimCommitted = resolve;
+      });
+      let releaseClaimResult: () => void = () => undefined;
+      const claimResultReleased = new Promise<void>((resolve) => {
+        releaseClaimResult = resolve;
+      });
+      const transaction = database.db.transaction.bind(
+        database.db,
+      ) as unknown as (...args: unknown[]) => Promise<unknown>;
+      const claimDb = new Proxy(database.db, {
+        get(target, property) {
+          if (property === "transaction") {
+            return async (...args: unknown[]) => {
+              const outcome = await transaction(...args);
+              signalClaimCommitted();
+              await claimResultReleased;
+              return outcome;
+            };
+          }
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      await database.sql`
+        CREATE FUNCTION test_delay_privy_attempt_consumption()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          PERFORM pg_sleep(0.5);
+          RETURN NEW;
+        END
+        $$
+      `;
+      await database.sql`
+        CREATE TRIGGER test_delay_privy_attempt_consumption
+        BEFORE UPDATE ON privy_migration_attempt
+        FOR EACH ROW
+        EXECUTE FUNCTION test_delay_privy_attempt_consumption()
+      `;
+      try {
+        const claimPromise = claimPrivyMigration({
+          accessToken: "race-token",
+          attemptId: migrationAttempt.attemptId,
+          csrfToken: migrationAttempt.csrfToken,
+          db: claimDb,
+          gateway: raceGateway,
+          userId: sourceSubject,
+        });
+        let mergePromise: ReturnType<typeof commitAccountMerge> | undefined;
+        let synchronizationFailure: unknown;
+        try {
+          const claimPid = await waitForDatabaseWaitEvent({
+            event: "PgSleep",
+            sqlClient: database.sql,
+          });
+          mergePromise = commitAccountMerge({
+            attemptId: mergeAttemptId,
+            db: database.db,
+            targetUserId: targetSubject,
+          });
+          await waitForBlockedBackend({
+            blockerPid: claimPid,
+            sqlClient: database.sql,
+          });
+        } catch (error) {
+          synchronizationFailure = error;
+        }
+        if (synchronizationFailure !== undefined) {
+          await Promise.allSettled([
+            claimPromise,
+            ...(mergePromise === undefined ? [] : [mergePromise]),
+          ]);
+          throw synchronizationFailure;
+        }
+        if (mergePromise === undefined) {
+          throw new Error("Account consolidation was not started");
+        }
+
+        await claimCommitted;
+        await expect(mergePromise).resolves.toEqual({ merged: true });
+        releaseClaimResult();
+        await expect(claimPromise).resolves.toMatchObject({
+          privyUserHint: expect.any(String),
+        });
+        expect(
+          await database.db
+            .select({ userId: privyMigrationClaim.userId })
+            .from(privyMigrationClaim)
+            .where(eq(privyMigrationClaim.privyUserId, privyUserId)),
+        ).toEqual([{ userId: targetSubject }]);
+      } finally {
+        await database.sql`
+          DROP TRIGGER IF EXISTS test_delay_privy_attempt_consumption
+          ON privy_migration_attempt
+        `;
+        await database.sql`
+          DROP FUNCTION IF EXISTS test_delay_privy_attempt_consumption()
+        `;
+        releaseClaimResult();
+      }
+    });
+
+    test("rejects a Privy claim when account consolidation holds the lifecycle lock first", async () => {
+      const sourceSubject = crypto.randomUUID();
+      const targetSubject = crypto.randomUUID();
+      const mergeAttemptId = crypto.randomUUID();
+      const principalId = crypto.randomUUID();
+      const privyUserId = `did:privy:${crypto.randomUUID()}`;
+      const mergeWallet = privateKeyToAccount(
+        "0x1919191919191919191919191919191919191919191919191919191919191919",
+      );
+      const now = new Date("2026-08-07T00:00:00.000Z");
+      await database.db.insert(user).values([
+        {
+          createdAt: now,
+          email: `${sourceSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: sourceSubject,
+          name: "Privy Merge Claim Source",
+          status: "active",
+          updatedAt: now,
+        },
+        {
+          createdAt: now,
+          email: `${targetSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: targetSubject,
+          name: "Privy Merge Claim Target",
+          status: "active",
+          updatedAt: now,
+        },
+      ]);
+      await database.db.insert(walletPrincipal).values({
+        accountKind: "eoa",
+        address: mergeWallet.address,
+        createdAt: now,
+        family: "evm",
+        id: principalId,
+        signInEnabled: true,
+        updatedAt: now,
+        userId: sourceSubject,
+      });
+      await database.db.insert(identitySubjectMerge).values({
+        actorUserId: targetSubject,
+        expiresAt: new Date(Date.now() + 60_000),
+        id: mergeAttemptId,
+        metadata: {},
+        sourceUserId: sourceSubject,
+        status: "prepared",
+        targetUserId: targetSubject,
+      });
+      const migrationAttempt = await createPrivyMigrationAttempt(
+        database.db,
+        sourceSubject,
+      );
+      const raceGateway: PrivyGateway = {
+        async authenticateAccessToken() {
+          return {
+            createdAt: now,
+            id: privyUserId,
+            linkedAccounts: [],
+          };
+        },
+      };
+
+      await database.sql`
+        CREATE FUNCTION test_delay_privy_merge_principal_move()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          PERFORM pg_sleep(0.5);
+          RETURN NEW;
+        END
+        $$
+      `;
+      await database.sql`
+        CREATE TRIGGER test_delay_privy_merge_principal_move
+        BEFORE UPDATE ON wallet_principal
+        FOR EACH ROW
+        EXECUTE FUNCTION test_delay_privy_merge_principal_move()
+      `;
+      try {
+        const mergePromise = commitAccountMerge({
+          attemptId: mergeAttemptId,
+          db: database.db,
+          targetUserId: targetSubject,
+        });
+        let claimPromise: ReturnType<typeof claimPrivyMigration> | undefined;
+        let synchronizationFailure: unknown;
+        try {
+          const mergePid = await waitForDatabaseWaitEvent({
+            event: "PgSleep",
+            sqlClient: database.sql,
+          });
+          claimPromise = claimPrivyMigration({
+            accessToken: "race-token",
+            attemptId: migrationAttempt.attemptId,
+            csrfToken: migrationAttempt.csrfToken,
+            db: database.db,
+            gateway: raceGateway,
+            userId: sourceSubject,
+          });
+          await waitForBlockedBackend({
+            blockerPid: mergePid,
+            sqlClient: database.sql,
+          });
+        } catch (error) {
+          synchronizationFailure = error;
+        }
+        if (synchronizationFailure !== undefined) {
+          await Promise.allSettled([
+            mergePromise,
+            ...(claimPromise === undefined ? [] : [claimPromise]),
+          ]);
+          throw synchronizationFailure;
+        }
+        if (claimPromise === undefined) {
+          throw new Error("Privy claim was not started");
+        }
+
+        await expect(mergePromise).resolves.toEqual({ merged: true });
+        await expect(claimPromise).rejects.toMatchObject({
+          code: "invalid_attempt",
+          status: 403,
+        });
+        expect(
+          await database.db
+            .select({ id: privyMigrationClaim.id })
+            .from(privyMigrationClaim)
+            .where(eq(privyMigrationClaim.privyUserId, privyUserId)),
+        ).toHaveLength(0);
+        expect(
+          await database.db
+            .select({ status: user.status })
+            .from(user)
+            .where(eq(user.id, sourceSubject)),
+        ).toEqual([{ status: "merged" }]);
+      } finally {
+        await database.sql`
+          DROP TRIGGER IF EXISTS test_delay_privy_merge_principal_move
+          ON wallet_principal
+        `;
+        await database.sql`
+          DROP FUNCTION IF EXISTS test_delay_privy_merge_principal_move()
+        `;
+      }
     });
 
     test("consolidates a proof-authenticated subject transactionally and revokes sessions and provider tokens", async () => {

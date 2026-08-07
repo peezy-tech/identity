@@ -3,8 +3,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { betterAuth, type BetterAuthPlugin } from "better-auth";
+import { APIError } from "better-auth/api";
 import { genericOAuth, jwt, siwe } from "better-auth/plugins";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   createRemoteJWKSet,
   jwtVerify,
@@ -113,7 +114,8 @@ function createConfiguredIdentityAuth(
     baseURL: config.baseUrl,
     secret: config.secret,
     trustedOrigins: [config.baseUrl, ...config.trustedOrigins],
-    database: createIdentityDatabaseAdapter(db, proofOnly),
+    database: createIdentityDatabaseAdapter(db, proofOnly, socialProviderNames),
+    disabledPaths: ["/unlink-account"],
     user: {
       additionalFields: {
         status: {
@@ -148,24 +150,6 @@ function createConfiguredIdentityAuth(
     databaseHooks: {
       account: {
         create: {
-          after: async (createdAccount) => {
-            if (proofOnly) return;
-            if (
-              !socialProviderNames.includes(
-                createdAccount.providerId as SocialProviderName,
-              )
-            ) {
-              return;
-            }
-            await db.insert(schema.identityAuditEvent).values({
-              actorUserId: createdAccount.userId,
-              credentialId: createdAccount.id,
-              id: crypto.randomUUID(),
-              kind: "social.linked",
-              metadata: { provider: createdAccount.providerId },
-              userId: createdAccount.userId,
-            });
-          },
           before: async (account) => ({ data: { ...account, idToken: null } }),
         },
         update: {
@@ -267,60 +251,288 @@ function createConfiguredIdentityAuth(
   return { auth, socialProviderNames };
 }
 
-function createIdentityDatabaseAdapter(db: IdentityDb, proofOnly = false) {
-  const createAdapter = drizzleAdapter(db, {
+function createIdentityDatabaseAdapter(
+  db: IdentityDb,
+  proofOnly = false,
+  socialProviderNames: readonly SocialProviderName[] = [],
+) {
+  const createRootAdapter = drizzleAdapter(db, {
     provider: "pg",
     schema,
   });
 
-  return (...args: Parameters<typeof createAdapter>) => {
-    const adapter = createAdapter(...args);
-    return {
-      ...adapter,
-      create: async (...createArgs: Parameters<typeof adapter.create>) => {
-        const [input] = createArgs;
-        if (proofOnly && input.model === "user") {
-          throw new Error("Proof authentication cannot create an account");
-        }
-        return adapter.create(...createArgs);
-      },
-      findOne: async (...findOneArgs: Parameters<typeof adapter.findOne>) => {
-        const [input] = findOneArgs;
-        const result = await adapter.findOne({
-          ...input,
-          ...(input.model === "walletAddress" && input.where !== undefined
-            ? {
-                where: input.where.map((condition) =>
-                  condition.field === "address"
-                    ? { ...condition, mode: "insensitive" }
-                    : condition,
-                ),
-              }
-            : {}),
+  return (...args: Parameters<typeof createRootAdapter>) => {
+    type Adapter = ReturnType<typeof createRootAdapter>;
+    type AdapterDb =
+      | IdentityDb
+      | Parameters<Parameters<IdentityDb["transaction"]>[0]>[0];
+
+    const createAdapter = (adapterDb: AdapterDb): Adapter =>
+      drizzleAdapter(adapterDb, {
+        provider: "pg",
+        schema,
+      })(...args);
+
+    // Account consolidation takes these same user locks before moving or
+    // revoking credentials. Rechecking existing account ownership after the
+    // lock makes the credential write linearizable with that lifecycle.
+    const withActiveAccountUsers = async <Result>(input: {
+      accountRows: { id: string; userId: string }[];
+      adapterDb: AdapterDb;
+      operation: (adapter: Adapter, adapterDb: AdapterDb) => Promise<Result>;
+      userIds: string[];
+    }): Promise<Result> => {
+      const userIds = [...new Set(input.userIds)].sort();
+      if (userIds.length === 0) {
+        return input.operation(createAdapter(input.adapterDb), input.adapterDb);
+      }
+      const lockedUsers = await input.adapterDb
+        .select({ id: schema.user.id, status: schema.user.status })
+        .from(schema.user)
+        .where(inArray(schema.user.id, userIds))
+        .orderBy(schema.user.id)
+        .for("update");
+      if (
+        lockedUsers.length !== userIds.length ||
+        lockedUsers.some((lockedUser) => lockedUser.status !== "active")
+      ) {
+        throw unavailableIdentityAccount();
+      }
+
+      const adapter = createAdapter(input.adapterDb);
+      if (input.accountRows.length > 0) {
+        const expectedOwners = new Map(
+          input.accountRows.map((accountRow) => [
+            accountRow.id,
+            accountRow.userId,
+          ]),
+        );
+        const accountRows = await adapter.findMany<{
+          id: string;
+          userId: string;
+        }>({
+          model: "account",
+          select: ["id", "userId"],
+          where: [
+            {
+              field: "id",
+              operator: "in",
+              value: [...expectedOwners.keys()],
+            },
+          ],
         });
         if (
-          (input.model === "user" && isDisabledIdentityUser(result)) ||
-          (input.model === "session" &&
-            isDisabledIdentityUser((result as { user?: unknown } | null)?.user))
+          accountRows.length !== expectedOwners.size ||
+          accountRows.some(
+            (accountRow) =>
+              expectedOwners.get(accountRow.id) !== accountRow.userId,
+          )
         ) {
-          return null;
+          throw unavailableIdentityAccount();
         }
-        return result;
-      },
-      findMany: async (
-        ...findManyArgs: Parameters<typeof adapter.findMany>
-      ) => {
-        const [input] = findManyArgs;
-        const results = await adapter.findMany(input);
-        return input.model === "session"
-          ? results.filter(
-              (result) =>
-                !isDisabledIdentityUser((result as { user?: unknown }).user),
-            )
-          : results;
-      },
+      }
+
+      return input.operation(adapter, input.adapterDb);
     };
+
+    const createWrappedAdapter = (
+      adapterDb: AdapterDb,
+      inTransaction: boolean,
+    ): Adapter => {
+      const adapter = createAdapter(adapterDb);
+      const runGuarded = async <Result>(input: {
+        accountRows: { id: string; userId: string }[];
+        operation: (adapter: Adapter, adapterDb: AdapterDb) => Promise<Result>;
+        userIds: string[];
+      }): Promise<Result> => {
+        if (inTransaction) {
+          return withActiveAccountUsers({ ...input, adapterDb });
+        }
+        return adapterDb.transaction((transaction) =>
+          withActiveAccountUsers({ ...input, adapterDb: transaction }),
+        );
+      };
+
+      const wrappedAdapter = {
+        ...adapter,
+        create: async (...createArgs: Parameters<typeof adapter.create>) => {
+          const [input] = createArgs;
+          if (proofOnly && input.model === "user") {
+            throw new Error("Proof authentication cannot create an account");
+          }
+          if (input.model !== "account") {
+            return adapter.create(...createArgs);
+          }
+          const userId = input.data.userId;
+          if (typeof userId !== "string") throw unavailableIdentityAccount();
+          return runGuarded({
+            accountRows: [],
+            operation: async (transactionAdapter, transactionDb) => {
+              const createdAccount = await transactionAdapter.create(
+                ...createArgs,
+              );
+              if (
+                !proofOnly &&
+                typeof createdAccount === "object" &&
+                createdAccount !== null &&
+                "id" in createdAccount &&
+                typeof createdAccount.id === "string" &&
+                "providerId" in createdAccount &&
+                typeof createdAccount.providerId === "string" &&
+                socialProviderNames.includes(
+                  createdAccount.providerId as SocialProviderName,
+                )
+              ) {
+                // Keep the immutable link audit in the credential transaction;
+                // an after hook would run only after this lifecycle lock ends.
+                await transactionDb.insert(schema.identityAuditEvent).values({
+                  actorUserId: userId,
+                  credentialId: createdAccount.id,
+                  id: crypto.randomUUID(),
+                  kind: "social.linked",
+                  metadata: { provider: createdAccount.providerId },
+                  userId,
+                });
+              }
+              return createdAccount;
+            },
+            userIds: [userId],
+          });
+        },
+        findOne: async (...findOneArgs: Parameters<typeof adapter.findOne>) => {
+          const [input] = findOneArgs;
+          const result = await adapter.findOne({
+            ...input,
+            ...(input.model === "walletAddress" && input.where !== undefined
+              ? {
+                  where: input.where.map((condition) =>
+                    condition.field === "address"
+                      ? { ...condition, mode: "insensitive" }
+                      : condition,
+                  ),
+                }
+              : {}),
+          });
+          if (
+            (input.model === "user" && isDisabledIdentityUser(result)) ||
+            (input.model === "session" &&
+              isDisabledIdentityUser(
+                (result as { user?: unknown } | null)?.user,
+              ))
+          ) {
+            return null;
+          }
+          return result;
+        },
+        findMany: async (
+          ...findManyArgs: Parameters<typeof adapter.findMany>
+        ) => {
+          const [input] = findManyArgs;
+          const results = await adapter.findMany(input);
+          return input.model === "session"
+            ? results.filter(
+                (result) =>
+                  !isDisabledIdentityUser((result as { user?: unknown }).user),
+              )
+            : results;
+        },
+        delete: async (...deleteArgs: Parameters<typeof adapter.delete>) => {
+          const [input] = deleteArgs;
+          if (input.model !== "account") return adapter.delete(...deleteArgs);
+          const accountRows = await adapter.findMany<{
+            id: string;
+            userId: string;
+          }>({
+            model: "account",
+            select: ["id", "userId"],
+            where: input.where,
+          });
+          return runGuarded({
+            accountRows,
+            operation: (transactionAdapter) =>
+              transactionAdapter.delete(...deleteArgs),
+            userIds: accountRows.map((accountRow) => accountRow.userId),
+          });
+        },
+        deleteMany: async (
+          ...deleteManyArgs: Parameters<typeof adapter.deleteMany>
+        ) => {
+          const [input] = deleteManyArgs;
+          if (input.model !== "account") {
+            return adapter.deleteMany(...deleteManyArgs);
+          }
+          const accountRows = await adapter.findMany<{
+            id: string;
+            userId: string;
+          }>({
+            model: "account",
+            select: ["id", "userId"],
+            where: input.where,
+          });
+          return runGuarded({
+            accountRows,
+            operation: (transactionAdapter) =>
+              transactionAdapter.deleteMany(...deleteManyArgs),
+            userIds: accountRows.map((accountRow) => accountRow.userId),
+          });
+        },
+        update: async (...updateArgs: Parameters<typeof adapter.update>) => {
+          const [input] = updateArgs;
+          if (input.model !== "account") return adapter.update(...updateArgs);
+          const accountRows = await adapter.findMany<{
+            id: string;
+            userId: string;
+          }>({
+            model: "account",
+            select: ["id", "userId"],
+            where: input.where,
+          });
+          return runGuarded({
+            accountRows,
+            operation: (transactionAdapter) =>
+              transactionAdapter.update(...updateArgs),
+            userIds: accountRows.map((accountRow) => accountRow.userId),
+          });
+        },
+        updateMany: async (
+          ...updateManyArgs: Parameters<typeof adapter.updateMany>
+        ) => {
+          const [input] = updateManyArgs;
+          if (input.model !== "account") {
+            return adapter.updateMany(...updateManyArgs);
+          }
+          const accountRows = await adapter.findMany<{
+            id: string;
+            userId: string;
+          }>({
+            model: "account",
+            select: ["id", "userId"],
+            where: input.where,
+          });
+          return runGuarded({
+            accountRows,
+            operation: (transactionAdapter) =>
+              transactionAdapter.updateMany(...updateManyArgs),
+            userIds: accountRows.map((accountRow) => accountRow.userId),
+          });
+        },
+        transaction: (callback: Parameters<Adapter["transaction"]>[0]) =>
+          adapterDb.transaction((transaction) =>
+            callback(createWrappedAdapter(transaction, true)),
+          ),
+      };
+      return wrappedAdapter as Adapter;
+    };
+
+    return createWrappedAdapter(db, false);
   };
+}
+
+function unavailableIdentityAccount(): APIError {
+  return new APIError("FORBIDDEN", {
+    code: "ACCOUNT_UNAVAILABLE",
+    message: "Identity account is unavailable",
+  });
 }
 
 function isDisabledIdentityUser(value: unknown): boolean {

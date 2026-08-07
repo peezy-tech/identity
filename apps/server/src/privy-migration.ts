@@ -11,6 +11,7 @@ import {
   privyMigrationAttempt,
   privyMigrationClaim,
   privyMigrationIdentity,
+  user,
   walletPrincipal,
 } from "./db/schema";
 import { parseSolanaAddress } from "./solana-auth";
@@ -215,6 +216,14 @@ export async function claimPrivyMigration(input: {
     .digest("hex");
 
   const outcome = await input.db.transaction(async (transaction) => {
+    const [subject] = await transaction
+      .select({ status: user.status })
+      .from(user)
+      .where(eq(user.id, input.userId))
+      .for("update")
+      .limit(1);
+    if (subject?.status !== "active") return { kind: "invalid" as const };
+
     const [consumed] = await transaction
       .update(privyMigrationAttempt)
       .set({ consumedAt: new Date() })
@@ -329,7 +338,10 @@ export async function claimPrivyMigration(input: {
         userId: input.userId,
       });
     }
-    return { claimId: claim.id, kind: "claimed" as const };
+    const claims = await listCurrentPrivyClaims(transaction, input.userId);
+    const claimed = claims.find((item) => item.id === claim.id);
+    if (claimed === undefined) return { kind: "claim_unavailable" as const };
+    return { claimed, kind: "claimed" as const };
   });
 
   if (outcome.kind === "invalid") {
@@ -346,16 +358,14 @@ export async function claimPrivyMigration(input: {
       "This Privy account is already claimed by another peezy.tech account",
     );
   }
-  const claims = await listCurrentPrivyClaims(input.db, input.userId);
-  const claimed = claims.find((claim) => claim.id === outcome.claimId);
-  if (claimed === undefined) {
+  if (outcome.kind === "claim_unavailable") {
     throw new PrivyMigrationError(
       503,
       "claim_unavailable",
       "Migration claim could not be loaded",
     );
   }
-  return claimed;
+  return outcome.claimed;
 }
 
 export async function listCurrentPrivyClaims(
