@@ -266,6 +266,17 @@ function createIdentityDatabaseAdapter(
     type AdapterDb =
       | IdentityDb
       | Parameters<Parameters<IdentityDb["transaction"]>[0]>[0];
+    type GuardedModel = "account" | "oauthConsent" | "walletAddress";
+    type GuardedRow = { id: string; userId: string | null };
+
+    const isGuardedModel = (model: string): model is GuardedModel =>
+      model === "account" ||
+      model === "oauthConsent" ||
+      model === "walletAddress";
+    const guardedUserIds = (rows: GuardedRow[]): string[] =>
+      rows.flatMap((row) =>
+        typeof row.userId === "string" ? [row.userId] : [],
+      );
 
     const createAdapter = (adapterDb: AdapterDb): Adapter =>
       drizzleAdapter(adapterDb, {
@@ -277,8 +288,9 @@ function createIdentityDatabaseAdapter(
     // revoking credentials. Rechecking existing account ownership after the
     // lock makes the credential write linearizable with that lifecycle.
     const withActiveAccountUsers = async <Result>(input: {
-      accountRows: { id: string; userId: string }[];
+      accountRows: GuardedRow[];
       adapterDb: AdapterDb;
+      model: GuardedModel;
       operation: (adapter: Adapter, adapterDb: AdapterDb) => Promise<Result>;
       userIds: string[];
     }): Promise<Result> => {
@@ -309,9 +321,9 @@ function createIdentityDatabaseAdapter(
         );
         const accountRows = await adapter.findMany<{
           id: string;
-          userId: string;
+          userId: string | null;
         }>({
-          model: "account",
+          model: input.model,
           select: ["id", "userId"],
           where: [
             {
@@ -341,7 +353,8 @@ function createIdentityDatabaseAdapter(
     ): Adapter => {
       const adapter = createAdapter(adapterDb);
       const runGuarded = async <Result>(input: {
-        accountRows: { id: string; userId: string }[];
+        accountRows: GuardedRow[];
+        model: GuardedModel;
         operation: (adapter: Adapter, adapterDb: AdapterDb) => Promise<Result>;
         userIds: string[];
       }): Promise<Result> => {
@@ -360,18 +373,25 @@ function createIdentityDatabaseAdapter(
           if (proofOnly && input.model === "user") {
             throw new Error("Proof authentication cannot create an account");
           }
-          if (input.model !== "account") {
+          if (!isGuardedModel(input.model)) {
             return adapter.create(...createArgs);
           }
           const userId = input.data.userId;
-          if (typeof userId !== "string") throw unavailableIdentityAccount();
+          if (typeof userId !== "string") {
+            if (input.model === "oauthConsent") {
+              return adapter.create(...createArgs);
+            }
+            throw unavailableIdentityAccount();
+          }
           return runGuarded({
             accountRows: [],
+            model: input.model,
             operation: async (transactionAdapter, transactionDb) => {
               const createdAccount = await transactionAdapter.create(
                 ...createArgs,
               );
               if (
+                input.model === "account" &&
                 !proofOnly &&
                 typeof createdAccount === "object" &&
                 createdAccount !== null &&
@@ -438,82 +458,90 @@ function createIdentityDatabaseAdapter(
         },
         delete: async (...deleteArgs: Parameters<typeof adapter.delete>) => {
           const [input] = deleteArgs;
-          if (input.model !== "account") return adapter.delete(...deleteArgs);
+          if (!isGuardedModel(input.model)) {
+            return adapter.delete(...deleteArgs);
+          }
           const accountRows = await adapter.findMany<{
             id: string;
-            userId: string;
+            userId: string | null;
           }>({
-            model: "account",
+            model: input.model,
             select: ["id", "userId"],
             where: input.where,
           });
           return runGuarded({
             accountRows,
+            model: input.model,
             operation: (transactionAdapter) =>
               transactionAdapter.delete(...deleteArgs),
-            userIds: accountRows.map((accountRow) => accountRow.userId),
+            userIds: guardedUserIds(accountRows),
           });
         },
         deleteMany: async (
           ...deleteManyArgs: Parameters<typeof adapter.deleteMany>
         ) => {
           const [input] = deleteManyArgs;
-          if (input.model !== "account") {
+          if (!isGuardedModel(input.model)) {
             return adapter.deleteMany(...deleteManyArgs);
           }
           const accountRows = await adapter.findMany<{
             id: string;
-            userId: string;
+            userId: string | null;
           }>({
-            model: "account",
+            model: input.model,
             select: ["id", "userId"],
             where: input.where,
           });
           return runGuarded({
             accountRows,
+            model: input.model,
             operation: (transactionAdapter) =>
               transactionAdapter.deleteMany(...deleteManyArgs),
-            userIds: accountRows.map((accountRow) => accountRow.userId),
+            userIds: guardedUserIds(accountRows),
           });
         },
         update: async (...updateArgs: Parameters<typeof adapter.update>) => {
           const [input] = updateArgs;
-          if (input.model !== "account") return adapter.update(...updateArgs);
+          if (!isGuardedModel(input.model)) {
+            return adapter.update(...updateArgs);
+          }
           const accountRows = await adapter.findMany<{
             id: string;
-            userId: string;
+            userId: string | null;
           }>({
-            model: "account",
+            model: input.model,
             select: ["id", "userId"],
             where: input.where,
           });
           return runGuarded({
             accountRows,
+            model: input.model,
             operation: (transactionAdapter) =>
               transactionAdapter.update(...updateArgs),
-            userIds: accountRows.map((accountRow) => accountRow.userId),
+            userIds: guardedUserIds(accountRows),
           });
         },
         updateMany: async (
           ...updateManyArgs: Parameters<typeof adapter.updateMany>
         ) => {
           const [input] = updateManyArgs;
-          if (input.model !== "account") {
+          if (!isGuardedModel(input.model)) {
             return adapter.updateMany(...updateManyArgs);
           }
           const accountRows = await adapter.findMany<{
             id: string;
-            userId: string;
+            userId: string | null;
           }>({
-            model: "account",
+            model: input.model,
             select: ["id", "userId"],
             where: input.where,
           });
           return runGuarded({
             accountRows,
+            model: input.model,
             operation: (transactionAdapter) =>
               transactionAdapter.updateMany(...updateManyArgs),
-            userIds: accountRows.map((accountRow) => accountRow.userId),
+            userIds: guardedUserIds(accountRows),
           });
         },
         transaction: (callback: Parameters<Adapter["transaction"]>[0]) =>

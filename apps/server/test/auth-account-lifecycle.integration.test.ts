@@ -14,7 +14,10 @@ import {
   account,
   identityAuditEvent,
   identitySubjectMerge,
+  oauthClient,
+  oauthConsent,
   user,
+  walletAddress,
 } from "../src/db/schema";
 import * as schema from "../src/db/schema";
 
@@ -458,6 +461,444 @@ if (databaseUrl === undefined) {
           DROP FUNCTION IF EXISTS delay_account_delete_before_merge()
         `;
       }
+    });
+
+    test("moves a Better Auth wallet row when wallet creation holds the lifecycle lock", async () => {
+      const sourceUserId = crypto.randomUUID();
+      const targetUserId = crypto.randomUUID();
+      const mergeAttemptId = crypto.randomUUID();
+      const targetWalletId = crypto.randomUUID();
+      const sourceWalletAddress = "0x7100000000000000000000000000000000000001";
+      const targetWalletAddress = "0x7100000000000000000000000000000000000002";
+      const now = new Date("2026-08-07T00:00:00.000Z");
+      await db.insert(user).values([
+        {
+          createdAt: now,
+          email: `${sourceUserId}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: sourceUserId,
+          name: "Wallet Create Source",
+          status: "active",
+          updatedAt: now,
+        },
+        {
+          createdAt: now,
+          email: `${targetUserId}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: targetUserId,
+          name: "Wallet Create Target",
+          status: "active",
+          updatedAt: now,
+        },
+      ]);
+      await db.insert(walletAddress).values({
+        address: targetWalletAddress,
+        chainId: 1,
+        createdAt: now,
+        id: targetWalletId,
+        isPrimary: true,
+        userId: targetUserId,
+      });
+      await db.insert(identitySubjectMerge).values({
+        actorUserId: targetUserId,
+        expiresAt: new Date(Date.now() + 60_000),
+        id: mergeAttemptId,
+        metadata: {},
+        sourceUserId,
+        status: "prepared",
+        targetUserId,
+      });
+      await databaseSql`
+        CREATE FUNCTION delay_wallet_create_before_merge()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          PERFORM pg_sleep(1);
+          RETURN NEW;
+        END
+        $$
+      `;
+      await databaseSql`
+        CREATE TRIGGER delay_wallet_create_before_merge
+        BEFORE INSERT ON wallet_address
+        FOR EACH ROW
+        EXECUTE FUNCTION delay_wallet_create_before_merge()
+      `;
+
+      try {
+        const { auth } = createIdentityAuth(config, db);
+        const context = await auth.$context;
+        const walletPromise = context.adapter.create<
+          {
+            address: string;
+            chainId: number;
+            createdAt: Date;
+            isPrimary: boolean;
+            userId: string;
+          },
+          { id: string; userId: string }
+        >({
+          data: {
+            address: sourceWalletAddress,
+            chainId: 1,
+            createdAt: now,
+            isPrimary: true,
+            userId: sourceUserId,
+          },
+          model: "walletAddress",
+        });
+        const walletPid = await waitForDatabaseWaitEvent({
+          applicationName,
+          event: "PgSleep",
+          sqlClient: adminSql,
+        });
+        const mergePromise = commitAccountMerge({
+          attemptId: mergeAttemptId,
+          db,
+          targetUserId,
+        });
+        await waitForBlockedBackend({
+          applicationName,
+          blockerPid: walletPid,
+          sqlClient: adminSql,
+        });
+
+        const createdWallet = await walletPromise;
+        await expect(mergePromise).resolves.toEqual({ merged: true });
+        expect(createdWallet.userId).toBe(sourceUserId);
+        expect(
+          await db
+            .select({
+              address: walletAddress.address,
+              isPrimary: walletAddress.isPrimary,
+              userId: walletAddress.userId,
+            })
+            .from(walletAddress)
+            .where(eq(walletAddress.id, createdWallet.id)),
+        ).toEqual([
+          {
+            address: sourceWalletAddress,
+            isPrimary: false,
+            userId: targetUserId,
+          },
+        ]);
+        expect(
+          await db
+            .select({ isPrimary: walletAddress.isPrimary })
+            .from(walletAddress)
+            .where(eq(walletAddress.id, targetWalletId)),
+        ).toEqual([{ isPrimary: true }]);
+      } finally {
+        await databaseSql`
+          DROP TRIGGER IF EXISTS delay_wallet_create_before_merge
+          ON wallet_address
+        `;
+        await databaseSql`
+          DROP FUNCTION IF EXISTS delay_wallet_create_before_merge()
+        `;
+      }
+    });
+
+    test("rejects a Better Auth wallet row after consolidation wins the lifecycle lock", async () => {
+      const sourceUserId = crypto.randomUUID();
+      const targetUserId = crypto.randomUUID();
+      const mergeAttemptId = crypto.randomUUID();
+      const racedWalletAddress = "0x7200000000000000000000000000000000000001";
+      const now = new Date("2026-08-07T00:00:00.000Z");
+      await db.insert(user).values([
+        {
+          createdAt: now,
+          email: `${sourceUserId}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: sourceUserId,
+          name: "Wallet Merge Source",
+          status: "active",
+          updatedAt: now,
+        },
+        {
+          createdAt: now,
+          email: `${targetUserId}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: targetUserId,
+          name: "Wallet Merge Target",
+          status: "active",
+          updatedAt: now,
+        },
+      ]);
+      await db.insert(identitySubjectMerge).values({
+        actorUserId: targetUserId,
+        expiresAt: new Date(Date.now() + 60_000),
+        id: mergeAttemptId,
+        metadata: {},
+        sourceUserId,
+        status: "prepared",
+        targetUserId,
+      });
+      const { auth } = createIdentityAuth(config, db);
+      const context = await auth.$context;
+      await expect(
+        commitAccountMerge({
+          attemptId: mergeAttemptId,
+          db,
+          targetUserId,
+        }),
+      ).resolves.toEqual({ merged: true });
+
+      await expect(
+        context.adapter.create({
+          data: {
+            address: racedWalletAddress,
+            chainId: 1,
+            createdAt: now,
+            isPrimary: true,
+            userId: sourceUserId,
+          },
+          model: "walletAddress",
+        }),
+      ).rejects.toMatchObject({
+        body: expect.objectContaining({ code: "ACCOUNT_UNAVAILABLE" }),
+        status: "FORBIDDEN",
+      });
+      expect(
+        await db
+          .select({ id: walletAddress.id })
+          .from(walletAddress)
+          .where(eq(walletAddress.address, racedWalletAddress)),
+      ).toHaveLength(0);
+    });
+
+    test("deletes OAuth consent when consent creation holds the lifecycle lock before consolidation", async () => {
+      const sourceUserId = crypto.randomUUID();
+      const targetUserId = crypto.randomUUID();
+      const mergeAttemptId = crypto.randomUUID();
+      const clientId = `consent-client-${crypto.randomUUID()}`;
+      const now = new Date("2026-08-07T00:00:00.000Z");
+      await db.insert(user).values([
+        {
+          createdAt: now,
+          email: `${sourceUserId}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: sourceUserId,
+          name: "Consent Create Source",
+          status: "active",
+          updatedAt: now,
+        },
+        {
+          createdAt: now,
+          email: `${targetUserId}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: targetUserId,
+          name: "Consent Create Target",
+          status: "active",
+          updatedAt: now,
+        },
+      ]);
+      await db.insert(oauthClient).values({ clientId, redirectUris: [] });
+      await db.insert(identitySubjectMerge).values({
+        actorUserId: targetUserId,
+        expiresAt: new Date(Date.now() + 60_000),
+        id: mergeAttemptId,
+        metadata: {},
+        sourceUserId,
+        status: "prepared",
+        targetUserId,
+      });
+      await databaseSql`
+        CREATE FUNCTION delay_consent_create_before_merge()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          PERFORM pg_sleep(1);
+          RETURN NEW;
+        END
+        $$
+      `;
+      await databaseSql`
+        CREATE TRIGGER delay_consent_create_before_merge
+        BEFORE INSERT ON oauth_consent
+        FOR EACH ROW
+        EXECUTE FUNCTION delay_consent_create_before_merge()
+      `;
+
+      try {
+        const { auth } = createIdentityAuth(config, db);
+        const context = await auth.$context;
+        const consentPromise = context.adapter.create<
+          {
+            clientId: string;
+            createdAt: Date;
+            scopes: string[];
+            updatedAt: Date;
+            userId: string;
+          },
+          { id: string; userId: string }
+        >({
+          data: {
+            clientId,
+            createdAt: now,
+            scopes: ["openid"],
+            updatedAt: now,
+            userId: sourceUserId,
+          },
+          model: "oauthConsent",
+        });
+        const consentPid = await waitForDatabaseWaitEvent({
+          applicationName,
+          event: "PgSleep",
+          sqlClient: adminSql,
+        });
+        const mergePromise = commitAccountMerge({
+          attemptId: mergeAttemptId,
+          db,
+          targetUserId,
+        });
+        await waitForBlockedBackend({
+          applicationName,
+          blockerPid: consentPid,
+          sqlClient: adminSql,
+        });
+
+        const createdConsent = await consentPromise;
+        await expect(mergePromise).resolves.toEqual({ merged: true });
+        expect(createdConsent.userId).toBe(sourceUserId);
+        expect(
+          await db
+            .select({ id: oauthConsent.id })
+            .from(oauthConsent)
+            .where(eq(oauthConsent.id, createdConsent.id)),
+        ).toHaveLength(0);
+      } finally {
+        await databaseSql`
+          DROP TRIGGER IF EXISTS delay_consent_create_before_merge
+          ON oauth_consent
+        `;
+        await databaseSql`
+          DROP FUNCTION IF EXISTS delay_consent_create_before_merge()
+        `;
+      }
+    });
+
+    test("rejects OAuth consent after consolidation wins the lifecycle lock", async () => {
+      const sourceUserId = crypto.randomUUID();
+      const targetUserId = crypto.randomUUID();
+      const mergeAttemptId = crypto.randomUUID();
+      const clientId = `consent-client-${crypto.randomUUID()}`;
+      const now = new Date("2026-08-07T00:00:00.000Z");
+      await db.insert(user).values([
+        {
+          createdAt: now,
+          email: `${sourceUserId}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: sourceUserId,
+          name: "Consent Merge Source",
+          status: "active",
+          updatedAt: now,
+        },
+        {
+          createdAt: now,
+          email: `${targetUserId}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: targetUserId,
+          name: "Consent Merge Target",
+          status: "active",
+          updatedAt: now,
+        },
+      ]);
+      await db.insert(oauthClient).values({ clientId, redirectUris: [] });
+      await db.insert(identitySubjectMerge).values({
+        actorUserId: targetUserId,
+        expiresAt: new Date(Date.now() + 60_000),
+        id: mergeAttemptId,
+        metadata: {},
+        sourceUserId,
+        status: "prepared",
+        targetUserId,
+      });
+      const { auth } = createIdentityAuth(config, db);
+      const context = await auth.$context;
+      await expect(
+        commitAccountMerge({
+          attemptId: mergeAttemptId,
+          db,
+          targetUserId,
+        }),
+      ).resolves.toEqual({ merged: true });
+
+      await expect(
+        context.adapter.create({
+          data: {
+            clientId,
+            createdAt: now,
+            scopes: ["openid"],
+            updatedAt: now,
+            userId: sourceUserId,
+          },
+          model: "oauthConsent",
+        }),
+      ).rejects.toMatchObject({
+        body: expect.objectContaining({ code: "ACCOUNT_UNAVAILABLE" }),
+        status: "FORBIDDEN",
+      });
+      expect(
+        await db
+          .select({ id: oauthConsent.id })
+          .from(oauthConsent)
+          .where(eq(oauthConsent.userId, sourceUserId)),
+      ).toHaveLength(0);
+    });
+
+    test("preserves nullable-owner OAuth consent mutations", async () => {
+      const clientId = `consent-client-${crypto.randomUUID()}`;
+      const now = new Date("2026-08-07T00:00:00.000Z");
+      await db.insert(oauthClient).values({ clientId, redirectUris: [] });
+      const { auth } = createIdentityAuth(config, db);
+      const context = await auth.$context;
+
+      const createdConsent = await context.adapter.create<
+        {
+          clientId: string;
+          createdAt: Date;
+          scopes: string[];
+          updatedAt: Date;
+          userId: null;
+        },
+        { id: string; userId: null }
+      >({
+        data: {
+          clientId,
+          createdAt: now,
+          scopes: ["openid"],
+          updatedAt: now,
+          userId: null,
+        },
+        model: "oauthConsent",
+      });
+      expect(createdConsent.userId).toBeNull();
+      await expect(
+        context.adapter.update({
+          model: "oauthConsent",
+          update: { scopes: ["openid", "profile"] },
+          where: [{ field: "id", value: createdConsent.id }],
+        }),
+      ).resolves.toMatchObject({
+        id: createdConsent.id,
+        scopes: ["openid", "profile"],
+        userId: null,
+      });
+      await expect(
+        context.adapter.delete({
+          model: "oauthConsent",
+          where: [{ field: "id", value: createdConsent.id }],
+        }),
+      ).resolves.toBeUndefined();
+      expect(
+        await db
+          .select({ id: oauthConsent.id })
+          .from(oauthConsent)
+          .where(eq(oauthConsent.id, createdConsent.id)),
+      ).toHaveLength(0);
     });
 
     test("keeps unmatched account mutations as no-ops", async () => {
