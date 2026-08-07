@@ -365,6 +365,11 @@ if (databaseUrl === undefined) {
       );
       const survivor = await signInHostedWallet(app, config, survivorWallet);
       const source = await signInHostedWallet(app, config, sourceWallet);
+      const sourceEmail = "source-merge@example.com";
+      await database.db
+        .update(user)
+        .set({ email: sourceEmail, emailVerified: true, updatedAt: new Date() })
+        .where(eq(user.id, source.userId));
       await database.db.insert(account).values({
         accountId: "github-source-merge",
         id: crypto.randomUUID(),
@@ -419,6 +424,11 @@ if (databaseUrl === undefined) {
         .from(user)
         .where(eq(user.id, source.userId));
       expect(sourceRow?.status).toBe("merged");
+      const [sourceEmailRow] = await database.db
+        .select({ email: user.email })
+        .from(user)
+        .where(eq(user.id, source.userId));
+      expect(sourceEmailRow?.email).toMatch(/\.invalid$/);
       expect(
         await database.db
           .select()
@@ -438,6 +448,11 @@ if (databaseUrl === undefined) {
           expect.objectContaining({
             address: sourceWallet.address.toLowerCase(),
             kind: "wallet",
+          }),
+          expect.objectContaining({
+            kind: "email",
+            value: sourceEmail,
+            verified: true,
           }),
           expect.objectContaining({ kind: "social", provider: "github" }),
         ]),

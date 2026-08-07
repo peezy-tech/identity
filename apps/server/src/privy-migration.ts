@@ -463,7 +463,7 @@ export function normalizePrivyIdentities(
   const normalized = new Map<string, NormalizedPrivyIdentity>();
   for (const linkedAccount of linkedAccounts) {
     const type = stringField(linkedAccount, "type") ?? "unknown";
-    const sourceAccountId = firstStringField(linkedAccount, [
+    const sourceAccountId = firstStringOrNumberField(linkedAccount, [
       "subject",
       "user_id",
       "id",
@@ -642,6 +642,7 @@ function safePrimitiveMetadata(
     "connector_type",
     "delegated",
     "embedded_wallet_type",
+    "fid",
     "first_verified_at",
     "imported",
     "latest_verified_at",
@@ -697,6 +698,22 @@ function firstStringField(
   for (const field of fields) {
     const result = stringField(value, field);
     if (result !== undefined) return result;
+  }
+  return undefined;
+}
+
+function firstStringOrNumberField(
+  value: Record<string, unknown>,
+  fields: string[],
+): string | undefined {
+  for (const field of fields) {
+    const result = value[field];
+    if (typeof result === "string" && result.trim().length > 0) {
+      return result.trim();
+    }
+    if (typeof result === "number" && Number.isFinite(result)) {
+      return String(result);
+    }
   }
   return undefined;
 }

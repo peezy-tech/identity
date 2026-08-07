@@ -67,6 +67,21 @@ describe("Privy migration identity normalization", () => {
     );
   });
 
+  test("keeps numeric-only identity identifiers distinct", () => {
+    const normalized = normalizePrivyIdentities([
+      { fid: 42, type: "farcaster" },
+      { fid: 43, type: "farcaster" },
+    ]);
+
+    expect(normalized).toHaveLength(2);
+    expect(new Set(normalized.map((item) => item.sourceAccountId))).toEqual(
+      new Set(["42", "43"]),
+    );
+    expect(new Set(normalized.map((item) => item.metadata.fid))).toEqual(
+      new Set([42, 43]),
+    );
+  });
+
   test("keeps smart wallets chain-unscoped and marks them as smart accounts", () => {
     const [identity] = normalizePrivyIdentities([
       {

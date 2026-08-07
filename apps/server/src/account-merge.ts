@@ -140,13 +140,23 @@ export async function commitAccountMerge(input: {
     }
 
     const identities = await transaction
-      .select({ id: user.id, status: user.status })
+      .select({
+        email: user.email,
+        emailVerified: user.emailVerified,
+        id: user.id,
+        status: user.status,
+      })
       .from(user)
       .where(inArray(user.id, [attempt.sourceUserId, attempt.targetUserId]))
       .for("update");
     const source = identities.find((item) => item.id === attempt.sourceUserId);
     const target = identities.find((item) => item.id === attempt.targetUserId);
-    if (source?.status !== "active" || target?.status !== "active") {
+    if (
+      source === undefined ||
+      target === undefined ||
+      source.status !== "active" ||
+      target.status !== "active"
+    ) {
       throw new AccountMergeError(
         409,
         "account_unavailable",
@@ -181,6 +191,33 @@ export async function commitAccountMerge(input: {
         "support_required",
         "This account owns organization or application state and requires support",
       );
+    }
+
+    const sourceHasEmailCredential = !source.email.endsWith(".invalid");
+    if (sourceHasEmailCredential && !target.email.endsWith(".invalid")) {
+      throw new AccountMergeError(
+        409,
+        "support_required",
+        "Both accounts have email credentials and require support",
+      );
+    }
+    if (sourceHasEmailCredential) {
+      await transaction
+        .update(user)
+        .set({
+          email: `merged-${crypto.randomUUID()}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          updatedAt: new Date(),
+        })
+        .where(eq(user.id, attempt.sourceUserId));
+      await transaction
+        .update(user)
+        .set({
+          email: source.email,
+          emailVerified: source.emailVerified,
+          updatedAt: new Date(),
+        })
+        .where(eq(user.id, attempt.targetUserId));
     }
 
     const affectedPrincipals = await transaction
