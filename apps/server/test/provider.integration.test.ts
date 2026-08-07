@@ -244,6 +244,58 @@ if (databaseUrl === undefined) {
       ).toBe(false);
     });
 
+    test("keeps primary and proof SIWE nonces in separate namespaces", async () => {
+      const nonceWallet = privateKeyToAccount(
+        "0xabababababababababababababababababababababababababababababababab",
+      );
+      const chainId = 999;
+      const requestNonce = async (basePath: string) => {
+        const response = await app.request(
+          `https://identity.test${basePath}/siwe/nonce`,
+          {
+            body: JSON.stringify({
+              chainId,
+              walletAddress: nonceWallet.address,
+            }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          },
+        );
+        expect(response.status).toBe(200);
+        return ((await response.json()) as { nonce: string }).nonce;
+      };
+      const signIn = async (basePath: string, nonce: string) => {
+        const now = new Date();
+        const message = createSiweMessage({
+          address: nonceWallet.address,
+          chainId,
+          domain: "identity.test",
+          expirationTime: new Date(now.getTime() + 10 * 60_000),
+          issuedAt: now,
+          nonce,
+          statement: HOSTED_WALLET_STATEMENT,
+          uri: config.baseUrl,
+          version: "1",
+        });
+        return app.request(`https://identity.test${basePath}/siwe/verify`, {
+          body: JSON.stringify({
+            chainId,
+            message,
+            signature: await nonceWallet.signMessage({ message }),
+            walletAddress: nonceWallet.address,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        });
+      };
+
+      const primaryNonce = await requestNonce("/api/auth");
+      const proofNonce = await requestNonce("/api/proof-auth");
+      expect(proofNonce).not.toBe(primaryNonce);
+      expect((await signIn("/api/auth", primaryNonce)).status).toBe(200);
+      expect((await signIn("/api/proof-auth", proofNonce)).status).toBe(200);
+    });
+
     test("rejects request bodies above the public API limit", async () => {
       const response = await app.request(
         "https://identity.test/v1/wallet/challenges",
@@ -381,6 +433,22 @@ if (databaseUrl === undefined) {
         refreshTokenExpiresAt: new Date("2026-09-08T00:00:00.000Z"),
         userId: source.userId,
       });
+      const sourceAuthorization = await authorizeCode({
+        app,
+        identityCookie: source.cookie,
+        resource: "https://api.pledge.test",
+      });
+      const sourceTokenResponse = await exchangeAuthorizationCode({
+        app,
+        code: sourceAuthorization.code,
+        codeVerifier: sourceAuthorization.codeVerifier,
+        oidcSecret,
+        resource: "https://api.pledge.test",
+      });
+      expect(sourceTokenResponse.status).toBe(200);
+      const sourceToken = (await sourceTokenResponse.json()) as {
+        access_token: string;
+      };
       const proof = await signInHostedWallet(
         app,
         config,
@@ -463,6 +531,24 @@ if (databaseUrl === undefined) {
           .from(session)
           .where(eq(session.userId, source.userId)),
       ).toHaveLength(0);
+      const sourceIntrospection = await app.request(
+        "https://identity.test/api/auth/oauth2/introspect",
+        {
+          body: new URLSearchParams({
+            token: sourceToken.access_token,
+            token_type_hint: "access_token",
+          }),
+          headers: {
+            Authorization: basic("pledge-cash", oidcSecret),
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          method: "POST",
+        },
+      );
+      expect(sourceIntrospection.status).toBe(200);
+      expect(await sourceIntrospection.json()).toMatchObject({
+        active: false,
+      });
       expect(
         (await identityMe(database.db, survivor.userId)).credentials,
       ).toEqual(

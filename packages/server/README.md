@@ -20,6 +20,10 @@ import {
 const verify = createAccessTokenVerifier({
   audience: "https://api.my-app.example",
   issuer: "https://identity.peezy.tech/api/auth",
+  introspection: {
+    clientId: "my-app",
+    clientSecret: process.env.IDENTITY_OIDC_CLIENT_SECRET!,
+  },
 });
 
 const principal = await verify(token);
@@ -30,6 +34,11 @@ const identity = await getIdentity({
   subject: principal.subject,
 });
 ```
+
+The verifier introspects every token after local signature validation and fails
+closed when the provider reports it inactive. Use the registered OIDC client
+credentials for introspection; keep the separate application API secret for
+identity lookups.
 
 See the [source repository](https://github.com/peezy-tech/identity) for complete
 examples and trust-boundary documentation.

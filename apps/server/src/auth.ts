@@ -124,6 +124,15 @@ function createConfiguredIdentityAuth(
         },
       },
     },
+    verification: {
+      storeIdentifier: {
+        hash: async (identifier) =>
+          createHash("sha256")
+            .update(`peezy-identity-verification:${mode}\0`)
+            .update(identifier)
+            .digest("hex"),
+      },
+    },
     account: {
       encryptOAuthTokens: true,
       storeStateStrategy: "database",

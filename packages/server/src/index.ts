@@ -39,9 +39,17 @@ export type IdentityPrincipal = {
   subject: string;
 };
 
+export type AccessTokenIntrospectionOptions = {
+  clientId: string;
+  clientSecret: string;
+  fetcher?: ServerFetch;
+  url?: string;
+};
+
 export type AccessTokenVerifierOptions = {
   audience: string;
   issuer: string;
+  introspection: AccessTokenIntrospectionOptions;
   jwksUrl?: string;
 };
 
@@ -64,6 +72,44 @@ export function createAccessTokenVerifier(options: AccessTokenVerifierOptions) {
     const { payload } = await jwtVerify(token, getKey, verifyOptions);
     if (typeof payload.sub !== "string" || payload.sub.length === 0) {
       throw new Error("Identity access token is missing its subject");
+    }
+    const introspectionResponse = await (
+      options.introspection.fetcher ?? fetch
+    )(options.introspection.url ?? `${issuer}/oauth2/introspect`, {
+      body: new URLSearchParams({
+        token,
+        token_type_hint: "access_token",
+      }),
+      headers: {
+        Accept: "application/json",
+        Authorization: `Basic ${basicCredentials(
+          options.introspection.clientId,
+          options.introspection.clientSecret,
+        )}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      method: "POST",
+    });
+    const introspectionText = await introspectionResponse.text();
+    if (!introspectionResponse.ok) {
+      throw new Error("Identity access token introspection failed");
+    }
+    let introspection: unknown;
+    try {
+      introspection = JSON.parse(introspectionText);
+    } catch {
+      throw new Error("Identity access token introspection was invalid");
+    }
+    if (
+      typeof introspection !== "object" ||
+      introspection === null ||
+      !("active" in introspection) ||
+      introspection.active !== true
+    ) {
+      throw new Error("Identity access token is inactive");
+    }
+    if (!("sub" in introspection) || introspection.sub !== payload.sub) {
+      throw new Error("Identity access token subject does not match");
     }
     return { claims: payload, subject: payload.sub };
   };
