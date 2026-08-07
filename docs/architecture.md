@@ -6,11 +6,12 @@ peezy.tech Identity gives every person one stable subject across peezy.tech
 projects. It authenticates the person and records the credentials they have
 explicitly proved. It does not decide what that person may do inside a product.
 
-In v0.1, an account may be created with a configured social provider or an EVM
-wallet. Wallets are optional credentials, so a social-first account can remain
-walletless indefinitely. Verified email is an attribute learned from a social
-provider, not a standalone sign-in method. Passkeys are a reserved extension
-point rather than an enabled credential.
+In v0.1, an account may be created with a configured social provider, an EVM
+wallet through SIWE, or a Solana wallet through SIWS. Wallets are optional
+credentials, so a social-first account can remain walletless indefinitely.
+Verified email is an attribute learned from a social provider, not a standalone
+sign-in method. Passkeys are a reserved extension point rather than an enabled
+credential.
 
 ## Trust boundaries
 
@@ -69,6 +70,9 @@ The grant is authentication only. It is never a transaction authorization.
   auditable, atomic operation.
 - An EOA address has one owner across the EVM family. A verified chain is an
   observation, not a different person.
+- A Solana public key has one owner and is compared in its canonical,
+  case-sensitive base58 representation. SIWS proofs sign an exact, nonce-bound,
+  expiring message.
 - Smart-contract accounts are chain scoped and are not accepted as ordinary EOA
   credentials until their verification and recovery semantics are explicitly
   supported.

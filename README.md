@@ -8,9 +8,10 @@ is never required to create an account. Verified email is exposed as an
 identity attribute when a social provider supplies it. Passkeys are reserved as
 a future credential type in the public contract, but are not enabled in v0.1.
 
-The provider exposes OAuth 2.1 / OpenID Connect for normal application sign-in
-and a bounded wallet-grant flow for applications that need to preserve an
-in-page SIWE experience. Product authorization remains in each product:
+The provider exposes OAuth 2.1 / OpenID Connect for normal application sign-in,
+hosted EVM SIWE and Solana SIWS sign-in, and a bounded EVM wallet-grant flow for
+applications that need to preserve an in-page SIWE experience. Product
+authorization remains in each product:
 PledgeCash, for example, continues to own alert preferences, notification
 channels, subscriptions, and fresh Boardroom-control proofs.
 

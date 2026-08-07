@@ -117,6 +117,10 @@ async function smokeConsumer(
       const verifier = createAccessTokenVerifier({
         audience: "package-smoke",
         issuer: "https://identity.example.test/api/auth",
+        introspection: {
+          clientId: "package-smoke",
+          clientSecret: "package-smoke-secret",
+        },
       });
 
       if (

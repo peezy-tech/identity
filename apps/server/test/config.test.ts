@@ -115,4 +115,39 @@ describe("Identity config", () => {
       }),
     ).toThrow();
   });
+
+  test("keeps Privy migration off unless explicitly enabled and configured", () => {
+    expect(loadConfig(baseEnv).privyMigration).toBeUndefined();
+    expect(() =>
+      loadConfig({ ...baseEnv, PRIVY_MIGRATION_ENABLED: "true" }),
+    ).toThrow(
+      "PRIVY_MIGRATION_APP_ID and PRIVY_MIGRATION_APP_SECRET are required",
+    );
+
+    expect(
+      loadConfig({
+        ...baseEnv,
+        PRIVY_MIGRATION_APP_ID: "legacy-lobby",
+        PRIVY_MIGRATION_APP_SECRET: "privy-secret",
+        PRIVY_MIGRATION_ENABLED: "true",
+        PRIVY_MIGRATION_JWT_VERIFICATION_KEY: "verification-key",
+      }).privyMigration,
+    ).toEqual({
+      appId: "legacy-lobby",
+      appSecret: "privy-secret",
+      jwtVerificationKey: "verification-key",
+    });
+
+    expect(
+      loadConfig({
+        ...baseEnv,
+        PRIVY_APP_ID: "legacy-lobby-alias",
+        PRIVY_APP_SECRET: "privy-secret-alias",
+        PRIVY_MIGRATION_ENABLED: "true",
+      }).privyMigration,
+    ).toEqual({
+      appId: "legacy-lobby-alias",
+      appSecret: "privy-secret-alias",
+    });
+  });
 });

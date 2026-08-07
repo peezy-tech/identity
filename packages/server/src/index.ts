@@ -39,9 +39,18 @@ export type IdentityPrincipal = {
   subject: string;
 };
 
+export type AccessTokenIntrospectionOptions = {
+  clientId: string;
+  clientSecret: string;
+  fetcher?: ServerFetch;
+  timeoutMs?: number;
+  url?: string;
+};
+
 export type AccessTokenVerifierOptions = {
   audience: string;
   issuer: string;
+  introspection: AccessTokenIntrospectionOptions;
   jwksUrl?: string;
 };
 
@@ -50,8 +59,23 @@ export type ServerFetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+export const DEFAULT_ACCESS_TOKEN_INTROSPECTION_TIMEOUT_MS = 2_000;
+const MAX_ACCESS_TOKEN_INTROSPECTION_TIMEOUT_MS = 2_147_483_647;
+
 export function createAccessTokenVerifier(options: AccessTokenVerifierOptions) {
   const issuer = options.issuer.replace(/\/+$/, "");
+  const introspectionTimeoutMs =
+    options.introspection.timeoutMs ??
+    DEFAULT_ACCESS_TOKEN_INTROSPECTION_TIMEOUT_MS;
+  if (
+    !Number.isFinite(introspectionTimeoutMs) ||
+    introspectionTimeoutMs <= 0 ||
+    introspectionTimeoutMs > MAX_ACCESS_TOKEN_INTROSPECTION_TIMEOUT_MS
+  ) {
+    throw new RangeError(
+      "Identity introspection timeout must be positive and no greater than 2147483647 milliseconds",
+    );
+  }
   const getKey = createRemoteJWKSet(
     new URL(options.jwksUrl ?? `${issuer}/jwks`),
   );
@@ -64,6 +88,69 @@ export function createAccessTokenVerifier(options: AccessTokenVerifierOptions) {
     const { payload } = await jwtVerify(token, getKey, verifyOptions);
     if (typeof payload.sub !== "string" || payload.sub.length === 0) {
       throw new Error("Identity access token is missing its subject");
+    }
+    const abortController = new AbortController();
+    const timeoutError = new Error(
+      "Identity access token introspection timed out",
+    );
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        reject(timeoutError);
+        abortController.abort(timeoutError);
+      }, introspectionTimeoutMs);
+    });
+    let introspectionResponse: Response;
+    let introspectionText: string;
+    try {
+      ({ response: introspectionResponse, text: introspectionText } =
+        await Promise.race([
+          (async () => {
+            const response = await (options.introspection.fetcher ?? fetch)(
+              options.introspection.url ?? `${issuer}/oauth2/introspect`,
+              {
+                body: new URLSearchParams({
+                  token,
+                  token_type_hint: "access_token",
+                }),
+                headers: {
+                  Accept: "application/json",
+                  Authorization: `Basic ${basicCredentials(
+                    options.introspection.clientId,
+                    options.introspection.clientSecret,
+                  )}`,
+                  "Content-Type": "application/x-www-form-urlencoded",
+                },
+                method: "POST",
+                signal: abortController.signal,
+              },
+            );
+            return { response, text: await response.text() };
+          })(),
+          deadline,
+        ]));
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!introspectionResponse.ok) {
+      throw new Error("Identity access token introspection failed");
+    }
+    let introspection: unknown;
+    try {
+      introspection = JSON.parse(introspectionText);
+    } catch {
+      throw new Error("Identity access token introspection was invalid");
+    }
+    if (
+      typeof introspection !== "object" ||
+      introspection === null ||
+      !("active" in introspection) ||
+      introspection.active !== true
+    ) {
+      throw new Error("Identity access token is inactive");
+    }
+    if (!("sub" in introspection) || introspection.sub !== payload.sub) {
+      throw new Error("Identity access token subject does not match");
     }
     return { claims: payload, subject: payload.sub };
   };

@@ -30,7 +30,10 @@ export const user = pgTable(
       .notNull(),
   },
   (table) => [
-    check("user_status_check", sql`${table.status} IN ('active', 'disabled')`),
+    check(
+      "user_status_check",
+      sql`${table.status} IN ('active', 'disabled', 'merged')`,
+    ),
   ],
 );
 
@@ -181,20 +184,29 @@ export const walletPrincipal = pgTable(
   (table) => [
     uniqueIndex("wallet_principal_eoa_address_uidx")
       .on(table.family, sql`lower(${table.address})`)
-      .where(sql`${table.accountKind} = 'eoa'`),
+      .where(sql`${table.family} = 'evm' AND ${table.accountKind} = 'eoa'`),
+    uniqueIndex("wallet_principal_solana_address_uidx")
+      .on(table.family, table.address)
+      .where(sql`${table.family} = 'solana'`),
     uniqueIndex("wallet_principal_smart_account_uidx")
       .on(table.family, table.chainId, sql`lower(${table.address})`)
-      .where(sql`${table.accountKind} = 'smart-account'`),
+      .where(
+        sql`${table.family} = 'evm' AND ${table.accountKind} = 'smart-account'`,
+      ),
     index("wallet_principal_user_idx").on(table.userId),
-    check("wallet_principal_family_check", sql`${table.family} = 'evm'`),
+    check(
+      "wallet_principal_family_check",
+      sql`${table.family} IN ('evm', 'solana')`,
+    ),
     check(
       "wallet_principal_kind_check",
       sql`${table.accountKind} IN ('eoa', 'smart-account')`,
     ),
     check(
       "wallet_principal_scope_check",
-      sql`(${table.accountKind} = 'eoa' AND ${table.chainId} IS NULL)
-        OR (${table.accountKind} = 'smart-account' AND ${table.chainId} > 0)`,
+      sql`(${table.family} = 'evm' AND ${table.accountKind} = 'eoa' AND ${table.chainId} IS NULL)
+        OR (${table.family} = 'evm' AND ${table.accountKind} = 'smart-account' AND ${table.chainId} > 0)
+        OR (${table.family} = 'solana' AND ${table.accountKind} = 'eoa' AND ${table.chainId} IS NULL)`,
     ),
   ],
 );
@@ -317,6 +329,195 @@ export const identityAuditEvent = pgTable(
   (table) => [
     index("identity_audit_event_user_idx").on(table.userId, table.createdAt),
     index("identity_audit_event_kind_idx").on(table.kind, table.createdAt),
+  ],
+);
+
+export const privyMigrationAttempt = pgTable(
+  "privy_migration_attempt",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    csrfHash: text("csrf_hash").notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+    consumedAt: timestamp("consumed_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("privy_migration_attempt_user_idx").on(table.userId, table.createdAt),
+    index("privy_migration_attempt_expiry_idx").on(table.expiresAt),
+  ],
+);
+
+export const privyMigrationClaim = pgTable(
+  "privy_migration_claim",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    privyUserId: text("privy_user_id").notNull().unique(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    snapshotDigest: text("snapshot_digest").notNull(),
+    state: text("state").default("claimed").notNull(),
+    claimedAt: timestamp("claimed_at").defaultNow().notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at")
+      .defaultNow()
+      .$onUpdate(() => /* @__PURE__ */ new Date())
+      .notNull(),
+  },
+  (table) => [
+    index("privy_migration_claim_user_idx").on(table.userId, table.claimedAt),
+    check(
+      "privy_migration_claim_state_check",
+      sql`${table.state} IN ('claimed', 'revoked')`,
+    ),
+  ],
+);
+
+export const privyMigrationIdentity = pgTable(
+  "privy_migration_identity",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    claimId: text("claim_id")
+      .notNull()
+      .references(() => privyMigrationClaim.id, { onDelete: "cascade" }),
+    type: text("type").notNull(),
+    provider: text("provider"),
+    sourceAccountId: text("source_account_id").notNull(),
+    sourceKey: text("source_key").notNull(),
+    displayHint: text("display_hint").notNull(),
+    walletAddress: text("wallet_address"),
+    walletType: text("wallet_type"),
+    chainType: text("chain_type"),
+    verifiedAt: timestamp("verified_at"),
+    disposition: text("disposition").notNull(),
+    targetCredentialId: text("target_credential_id"),
+    metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at")
+      .defaultNow()
+      .$onUpdate(() => /* @__PURE__ */ new Date())
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("privy_migration_identity_claim_source_uidx").on(
+      table.claimId,
+      table.sourceKey,
+    ),
+    index("privy_migration_identity_claim_idx").on(table.claimId),
+    index("privy_migration_identity_provider_idx").on(
+      table.provider,
+      table.sourceAccountId,
+    ),
+    index("privy_migration_identity_wallet_idx").on(
+      sql`lower(${table.walletAddress})`,
+    ),
+    check(
+      "privy_migration_identity_disposition_check",
+      sql`${table.disposition} IN ('already_linked', 'needs_reverification', 'legacy_only', 'conflict', 'linked')`,
+    ),
+  ],
+);
+
+export const accountWalletLinkChallenge = pgTable(
+  "account_wallet_link_challenge",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    nonce: text("nonce").notNull().unique(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    address: text("address").notNull(),
+    family: text("family").default("evm").notNull(),
+    chainId: integer("chain_id"),
+    message: text("message").notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+    usedAt: timestamp("used_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("account_wallet_link_challenge_user_idx").on(
+      table.userId,
+      table.createdAt,
+    ),
+    index("account_wallet_link_challenge_expiry_idx").on(table.expiresAt),
+    check(
+      "account_wallet_link_family_check",
+      sql`${table.family} IN ('evm', 'solana')`,
+    ),
+    check(
+      "account_wallet_link_chain_check",
+      sql`(${table.family} = 'evm' AND ${table.chainId} > 0)
+        OR (${table.family} = 'solana' AND ${table.chainId} IS NULL)`,
+    ),
+  ],
+);
+
+export const solanaAuthChallenge = pgTable(
+  "solana_auth_challenge",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    nonce: text("nonce").notNull().unique(),
+    mode: text("mode").notNull(),
+    address: text("address").notNull(),
+    message: text("message").notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+    usedAt: timestamp("used_at"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("solana_auth_challenge_expiry_idx").on(table.expiresAt),
+    check(
+      "solana_auth_challenge_mode_check",
+      sql`${table.mode} IN ('primary', 'proof')`,
+    ),
+  ],
+);
+
+export const identitySubjectMerge = pgTable(
+  "identity_subject_merge",
+  {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()::text`),
+    sourceUserId: text("source_user_id")
+      .notNull()
+      .unique()
+      .references(() => user.id, { onDelete: "restrict" }),
+    targetUserId: text("target_user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "restrict" }),
+    actorUserId: text("actor_user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "restrict" }),
+    status: text("status").default("prepared").notNull(),
+    metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    committedAt: timestamp("committed_at"),
+  },
+  (table) => [
+    index("identity_subject_merge_target_idx").on(table.targetUserId),
+    check(
+      "identity_subject_merge_status_check",
+      sql`${table.status} IN ('prepared', 'committed')`,
+    ),
+    check(
+      "identity_subject_merge_distinct_users_check",
+      sql`${table.sourceUserId} <> ${table.targetUserId}`,
+    ),
   ],
 );
 

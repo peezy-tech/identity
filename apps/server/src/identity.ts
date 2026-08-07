@@ -72,6 +72,18 @@ export async function identityMe(
     });
   }
   for (const principal of principals) {
+    if (principal.family === "solana") {
+      credentials.push({
+        accountKind: "eoa",
+        address: principal.address,
+        family: "solana",
+        id: principal.id,
+        kind: "wallet",
+        linkedAt: principal.createdAt.toISOString(),
+        signInEnabled: principal.signInEnabled,
+      });
+      continue;
+    }
     const chains = verifiedWallets
       .filter(
         (wallet) =>

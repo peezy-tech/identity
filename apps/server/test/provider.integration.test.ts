@@ -1,5 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { createHash, randomBytes } from "node:crypto";
+import {
+  createHash,
+  generateKeyPairSync,
+  randomBytes,
+  sign,
+} from "node:crypto";
 import { resolve } from "node:path";
 
 import {
@@ -8,6 +13,7 @@ import {
   WalletGrantExchangeResponseSchema,
   WalletGrantResponseSchema,
 } from "@peezy.tech/identity";
+import bs58 from "bs58";
 import { eq } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { decodeJwt } from "jose";
@@ -23,16 +29,37 @@ import {
   validateLegacyIdentity,
   verifyImport,
 } from "../scripts/import-pledge-cash";
+import { commitAccountMerge } from "../src/account-merge";
 import { createIdentityApp } from "../src/app";
-import { createIdentityAuth } from "../src/auth";
+import { createIdentityAuth, createIdentityProofAuth } from "../src/auth";
 import { seedConfiguredClients } from "../src/clients";
 import type { IdentityConfig } from "../src/config";
 import { HOSTED_WALLET_STATEMENT } from "../src/constants";
 import { createDbClient, type IdentityDbClient } from "../src/db/client";
-import { rateLimit, user, walletAddress } from "../src/db/schema";
+import {
+  account,
+  accountWalletLinkChallenge,
+  identitySubjectMerge,
+  privyMigrationClaim,
+  privyMigrationIdentity,
+  rateLimit,
+  session,
+  user,
+  walletAddress,
+  walletChallenge,
+  walletGrant,
+  walletPrincipal,
+} from "../src/db/schema";
 import { identityMe } from "../src/identity";
+import {
+  claimPrivyMigration,
+  createPrivyMigrationAttempt,
+  PrivyMigrationError,
+  type PrivyGateway,
+} from "../src/privy-migration";
 import { MAX_RATE_LIMIT_WINDOW_MS, consumeRateLimit } from "../src/rate-limit";
 import { consumeSessionHandoff } from "../src/session-handoffs";
+import { createWalletGrant } from "../src/wallet-grants";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -53,6 +80,10 @@ if (databaseUrl === undefined) {
     const hostedWallet = privateKeyToAccount(
       "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
     );
+    const migratingWallet = privateKeyToAccount(
+      "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    const migratingSolanaWallet = createSolanaWallet();
     const config: IdentityConfig = {
       appClients: [
         {
@@ -76,6 +107,10 @@ if (databaseUrl === undefined) {
         },
       ],
       port: 8790,
+      privyMigration: {
+        appId: "legacy-lobby-app",
+        appSecret: "legacy-lobby-secret",
+      },
       secret: "identity-test-secret-01234567890123456789",
       socialProviders: {
         github: {
@@ -89,6 +124,74 @@ if (databaseUrl === undefined) {
 
     let database: IdentityDbClient;
     let app: ReturnType<typeof createIdentityApp>;
+    const privyGateway: PrivyGateway = {
+      async authenticateAccessToken(accessToken) {
+        if (
+          accessToken !== "valid-legacy-token" &&
+          accessToken !== "wallet-bundle-token" &&
+          accessToken !== "solana-wallet-bundle-token" &&
+          accessToken !== "concurrent-token"
+        ) {
+          throw new PrivyMigrationError(
+            401,
+            "invalid_proof",
+            "Privy authentication could not be verified",
+          );
+        }
+        if (accessToken === "wallet-bundle-token") {
+          return {
+            createdAt: new Date("2025-01-02T00:00:00Z"),
+            id: "did:privy:legacy-wallet-person",
+            linkedAccounts: [
+              {
+                address: migratingWallet.address,
+                chain_type: "ethereum",
+                type: "embedded_wallet",
+              },
+            ],
+          };
+        }
+        if (accessToken === "solana-wallet-bundle-token") {
+          return {
+            createdAt: new Date("2025-01-02T00:00:00Z"),
+            id: "did:privy:legacy-solana-person",
+            linkedAccounts: [
+              {
+                address: migratingSolanaWallet.address,
+                chain_type: "solana",
+                type: "embedded_wallet",
+              },
+            ],
+          };
+        }
+        if (accessToken === "concurrent-token") {
+          return {
+            createdAt: new Date("2025-01-03T00:00:00Z"),
+            id: "did:privy:concurrent-person",
+            linkedAccounts: [],
+          };
+        }
+        return {
+          createdAt: new Date("2025-01-01T00:00:00Z"),
+          id: "did:privy:legacy-person",
+          linkedAccounts: [
+            {
+              subject: "github-legacy",
+              type: "github_oauth",
+              username: "legacy",
+            },
+            { subject: "discord-one", type: "discord_oauth" },
+            { subject: "discord-two", type: "discord_oauth" },
+            {
+              address: "0x3000000000000000000000000000000000000000",
+              chain_type: "ethereum",
+              type: "wallet",
+            },
+            { fid: 42, type: "farcaster" },
+          ],
+        };
+      },
+    };
 
     beforeAll(async () => {
       database = createDbClient(databaseUrl);
@@ -107,6 +210,8 @@ if (databaseUrl === undefined) {
         auth,
         config,
         db: database.db,
+        privyGateway,
+        proofAuth: createIdentityProofAuth(config, database.db),
         socialProviderNames,
       });
     });
@@ -148,6 +253,58 @@ if (databaseUrl === undefined) {
       ).toBe(false);
     });
 
+    test("keeps primary and proof SIWE nonces in separate namespaces", async () => {
+      const nonceWallet = privateKeyToAccount(
+        "0xabababababababababababababababababababababababababababababababab",
+      );
+      const chainId = 999;
+      const requestNonce = async (basePath: string) => {
+        const response = await app.request(
+          `https://identity.test${basePath}/siwe/nonce`,
+          {
+            body: JSON.stringify({
+              chainId,
+              walletAddress: nonceWallet.address,
+            }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          },
+        );
+        expect(response.status).toBe(200);
+        return ((await response.json()) as { nonce: string }).nonce;
+      };
+      const signIn = async (basePath: string, nonce: string) => {
+        const now = new Date();
+        const message = createSiweMessage({
+          address: nonceWallet.address,
+          chainId,
+          domain: "identity.test",
+          expirationTime: new Date(now.getTime() + 10 * 60_000),
+          issuedAt: now,
+          nonce,
+          statement: HOSTED_WALLET_STATEMENT,
+          uri: config.baseUrl,
+          version: "1",
+        });
+        return app.request(`https://identity.test${basePath}/siwe/verify`, {
+          body: JSON.stringify({
+            chainId,
+            message,
+            signature: await nonceWallet.signMessage({ message }),
+            walletAddress: nonceWallet.address,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        });
+      };
+
+      const primaryNonce = await requestNonce("/api/auth");
+      const proofNonce = await requestNonce("/api/proof-auth");
+      expect(proofNonce).not.toBe(primaryNonce);
+      expect((await signIn("/api/auth", primaryNonce)).status).toBe(200);
+      expect((await signIn("/api/proof-auth", proofNonce)).status).toBe(200);
+    });
+
     test("rejects request bodies above the public API limit", async () => {
       const response = await app.request(
         "https://identity.test/v1/wallet/challenges",
@@ -174,6 +331,957 @@ if (databaseUrl === undefined) {
         },
       );
       expect(authResponse.status).toBe(413);
+    });
+
+    test("claims a complete Privy bundle idempotently and never claims it for another subject", async () => {
+      const first = privateKeyToAccount(
+        "0x7777777777777777777777777777777777777777777777777777777777777777",
+      );
+      const second = privateKeyToAccount(
+        "0x8888888888888888888888888888888888888888888888888888888888888888",
+      );
+      const firstSignIn = await signInHostedWallet(app, config, first);
+      const secondSignIn = await signInHostedWallet(app, config, second);
+
+      const claim = async (cookie: string, token = "valid-legacy-token") => {
+        const attemptResponse = await app.request(
+          "https://identity.test/v1/migrations/privy/attempts",
+          {
+            headers: { Cookie: cookie, Origin: config.baseUrl },
+            method: "POST",
+          },
+        );
+        expect(attemptResponse.status).toBe(201);
+        const attempt = (await attemptResponse.json()) as {
+          attemptId: string;
+          csrfToken: string;
+        };
+        return app.request("https://identity.test/v1/migrations/privy/claims", {
+          body: JSON.stringify(attempt),
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            Cookie: cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        });
+      };
+
+      const firstClaim = await claim(firstSignIn.cookie);
+      expect(firstClaim.status).toBe(201);
+      const firstBody = (await firstClaim.json()) as { identities: unknown[] };
+      expect(firstBody.identities).toHaveLength(5);
+      expect((await claim(firstSignIn.cookie)).status).toBe(201);
+      const claimedElsewhere = await claim(secondSignIn.cookie);
+      expect(claimedElsewhere.status).toBe(409);
+      expect(await claimedElsewhere.json()).toMatchObject({
+        error: { code: "claimed_elsewhere" },
+      });
+
+      const [claimRow] = await database.db.select().from(privyMigrationClaim);
+      expect(claimRow?.userId).toBe(firstSignIn.userId);
+      const identityRows = await database.db
+        .select()
+        .from(privyMigrationIdentity);
+      expect(identityRows).toHaveLength(5);
+
+      const concurrentOne = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ),
+      );
+      const concurrentTwo = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        ),
+      );
+      const outcomes = await Promise.all([
+        claim(concurrentOne.cookie, "concurrent-token"),
+        claim(concurrentTwo.cookie, "concurrent-token"),
+      ]);
+      expect(outcomes.map((response) => response.status).sort()).toEqual([
+        201, 409,
+      ]);
+      expect(
+        await database.db
+          .select()
+          .from(privyMigrationClaim)
+          .where(
+            eq(privyMigrationClaim.privyUserId, "did:privy:concurrent-person"),
+          ),
+      ).toHaveLength(1);
+    });
+
+    test("moves a Privy claim when the claim lifecycle lock precedes account consolidation", async () => {
+      const sourceSubject = crypto.randomUUID();
+      const targetSubject = crypto.randomUUID();
+      const mergeAttemptId = crypto.randomUUID();
+      const privyUserId = `did:privy:${crypto.randomUUID()}`;
+      const now = new Date("2026-08-07T00:00:00.000Z");
+      await database.db.insert(user).values([
+        {
+          createdAt: now,
+          email: `${sourceSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: sourceSubject,
+          name: "Privy Claim Merge Source",
+          status: "active",
+          updatedAt: now,
+        },
+        {
+          createdAt: now,
+          email: `${targetSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: targetSubject,
+          name: "Privy Claim Merge Target",
+          status: "active",
+          updatedAt: now,
+        },
+      ]);
+      await database.db.insert(identitySubjectMerge).values({
+        actorUserId: targetSubject,
+        expiresAt: new Date(Date.now() + 60_000),
+        id: mergeAttemptId,
+        metadata: {},
+        sourceUserId: sourceSubject,
+        status: "prepared",
+        targetUserId: targetSubject,
+      });
+      const migrationAttempt = await createPrivyMigrationAttempt(
+        database.db,
+        sourceSubject,
+      );
+      const raceGateway: PrivyGateway = {
+        async authenticateAccessToken() {
+          return {
+            createdAt: now,
+            id: privyUserId,
+            linkedAccounts: [],
+          };
+        },
+      };
+      let signalClaimCommitted: () => void = () => undefined;
+      const claimCommitted = new Promise<void>((resolve) => {
+        signalClaimCommitted = resolve;
+      });
+      let releaseClaimResult: () => void = () => undefined;
+      const claimResultReleased = new Promise<void>((resolve) => {
+        releaseClaimResult = resolve;
+      });
+      const transaction = database.db.transaction.bind(
+        database.db,
+      ) as unknown as (...args: unknown[]) => Promise<unknown>;
+      const claimDb = new Proxy(database.db, {
+        get(target, property) {
+          if (property === "transaction") {
+            return async (...args: unknown[]) => {
+              const outcome = await transaction(...args);
+              signalClaimCommitted();
+              await claimResultReleased;
+              return outcome;
+            };
+          }
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      await database.sql`
+        CREATE FUNCTION test_delay_privy_attempt_consumption()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          PERFORM pg_sleep(0.5);
+          RETURN NEW;
+        END
+        $$
+      `;
+      await database.sql`
+        CREATE TRIGGER test_delay_privy_attempt_consumption
+        BEFORE UPDATE ON privy_migration_attempt
+        FOR EACH ROW
+        EXECUTE FUNCTION test_delay_privy_attempt_consumption()
+      `;
+      try {
+        const claimPromise = claimPrivyMigration({
+          accessToken: "race-token",
+          attemptId: migrationAttempt.attemptId,
+          csrfToken: migrationAttempt.csrfToken,
+          db: claimDb,
+          gateway: raceGateway,
+          userId: sourceSubject,
+        });
+        let mergePromise: ReturnType<typeof commitAccountMerge> | undefined;
+        let synchronizationFailure: unknown;
+        try {
+          const claimPid = await waitForDatabaseWaitEvent({
+            event: "PgSleep",
+            sqlClient: database.sql,
+          });
+          mergePromise = commitAccountMerge({
+            attemptId: mergeAttemptId,
+            db: database.db,
+            targetUserId: targetSubject,
+          });
+          await waitForBlockedBackend({
+            blockerPid: claimPid,
+            sqlClient: database.sql,
+          });
+        } catch (error) {
+          synchronizationFailure = error;
+        }
+        if (synchronizationFailure !== undefined) {
+          await Promise.allSettled([
+            claimPromise,
+            ...(mergePromise === undefined ? [] : [mergePromise]),
+          ]);
+          throw synchronizationFailure;
+        }
+        if (mergePromise === undefined) {
+          throw new Error("Account consolidation was not started");
+        }
+
+        await claimCommitted;
+        await expect(mergePromise).resolves.toEqual({ merged: true });
+        releaseClaimResult();
+        await expect(claimPromise).resolves.toMatchObject({
+          privyUserHint: expect.any(String),
+        });
+        expect(
+          await database.db
+            .select({ userId: privyMigrationClaim.userId })
+            .from(privyMigrationClaim)
+            .where(eq(privyMigrationClaim.privyUserId, privyUserId)),
+        ).toEqual([{ userId: targetSubject }]);
+      } finally {
+        await database.sql`
+          DROP TRIGGER IF EXISTS test_delay_privy_attempt_consumption
+          ON privy_migration_attempt
+        `;
+        await database.sql`
+          DROP FUNCTION IF EXISTS test_delay_privy_attempt_consumption()
+        `;
+        releaseClaimResult();
+      }
+    });
+
+    test("rejects a Privy claim when account consolidation holds the lifecycle lock first", async () => {
+      const sourceSubject = crypto.randomUUID();
+      const targetSubject = crypto.randomUUID();
+      const mergeAttemptId = crypto.randomUUID();
+      const principalId = crypto.randomUUID();
+      const privyUserId = `did:privy:${crypto.randomUUID()}`;
+      const mergeWallet = privateKeyToAccount(
+        "0x1919191919191919191919191919191919191919191919191919191919191919",
+      );
+      const now = new Date("2026-08-07T00:00:00.000Z");
+      await database.db.insert(user).values([
+        {
+          createdAt: now,
+          email: `${sourceSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: sourceSubject,
+          name: "Privy Merge Claim Source",
+          status: "active",
+          updatedAt: now,
+        },
+        {
+          createdAt: now,
+          email: `${targetSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: targetSubject,
+          name: "Privy Merge Claim Target",
+          status: "active",
+          updatedAt: now,
+        },
+      ]);
+      await database.db.insert(walletPrincipal).values({
+        accountKind: "eoa",
+        address: mergeWallet.address,
+        createdAt: now,
+        family: "evm",
+        id: principalId,
+        signInEnabled: true,
+        updatedAt: now,
+        userId: sourceSubject,
+      });
+      await database.db.insert(identitySubjectMerge).values({
+        actorUserId: targetSubject,
+        expiresAt: new Date(Date.now() + 60_000),
+        id: mergeAttemptId,
+        metadata: {},
+        sourceUserId: sourceSubject,
+        status: "prepared",
+        targetUserId: targetSubject,
+      });
+      const migrationAttempt = await createPrivyMigrationAttempt(
+        database.db,
+        sourceSubject,
+      );
+      const raceGateway: PrivyGateway = {
+        async authenticateAccessToken() {
+          return {
+            createdAt: now,
+            id: privyUserId,
+            linkedAccounts: [],
+          };
+        },
+      };
+
+      await database.sql`
+        CREATE FUNCTION test_delay_privy_merge_principal_move()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          PERFORM pg_sleep(0.5);
+          RETURN NEW;
+        END
+        $$
+      `;
+      await database.sql`
+        CREATE TRIGGER test_delay_privy_merge_principal_move
+        BEFORE UPDATE ON wallet_principal
+        FOR EACH ROW
+        EXECUTE FUNCTION test_delay_privy_merge_principal_move()
+      `;
+      try {
+        const mergePromise = commitAccountMerge({
+          attemptId: mergeAttemptId,
+          db: database.db,
+          targetUserId: targetSubject,
+        });
+        let claimPromise: ReturnType<typeof claimPrivyMigration> | undefined;
+        let synchronizationFailure: unknown;
+        try {
+          const mergePid = await waitForDatabaseWaitEvent({
+            event: "PgSleep",
+            sqlClient: database.sql,
+          });
+          claimPromise = claimPrivyMigration({
+            accessToken: "race-token",
+            attemptId: migrationAttempt.attemptId,
+            csrfToken: migrationAttempt.csrfToken,
+            db: database.db,
+            gateway: raceGateway,
+            userId: sourceSubject,
+          });
+          await waitForBlockedBackend({
+            blockerPid: mergePid,
+            sqlClient: database.sql,
+          });
+        } catch (error) {
+          synchronizationFailure = error;
+        }
+        if (synchronizationFailure !== undefined) {
+          await Promise.allSettled([
+            mergePromise,
+            ...(claimPromise === undefined ? [] : [claimPromise]),
+          ]);
+          throw synchronizationFailure;
+        }
+        if (claimPromise === undefined) {
+          throw new Error("Privy claim was not started");
+        }
+
+        await expect(mergePromise).resolves.toEqual({ merged: true });
+        await expect(claimPromise).rejects.toMatchObject({
+          code: "invalid_attempt",
+          status: 403,
+        });
+        expect(
+          await database.db
+            .select({ id: privyMigrationClaim.id })
+            .from(privyMigrationClaim)
+            .where(eq(privyMigrationClaim.privyUserId, privyUserId)),
+        ).toHaveLength(0);
+        expect(
+          await database.db
+            .select({ status: user.status })
+            .from(user)
+            .where(eq(user.id, sourceSubject)),
+        ).toEqual([{ status: "merged" }]);
+      } finally {
+        await database.sql`
+          DROP TRIGGER IF EXISTS test_delay_privy_merge_principal_move
+          ON wallet_principal
+        `;
+        await database.sql`
+          DROP FUNCTION IF EXISTS test_delay_privy_merge_principal_move()
+        `;
+      }
+    });
+
+    test("consolidates a proof-authenticated subject transactionally and revokes sessions and provider tokens", async () => {
+      const survivorWallet = privateKeyToAccount(
+        "0x5555555555555555555555555555555555555555555555555555555555555555",
+      );
+      const sourceWallet = privateKeyToAccount(
+        "0x6666666666666666666666666666666666666666666666666666666666666666",
+      );
+      const survivor = await signInHostedWallet(app, config, survivorWallet);
+      const source = await signInHostedWallet(app, config, sourceWallet);
+      const sourceEmail = "source-merge@example.com";
+      await database.db
+        .update(user)
+        .set({ email: sourceEmail, emailVerified: true, updatedAt: new Date() })
+        .where(eq(user.id, source.userId));
+      await database.db.insert(account).values({
+        accountId: "github-source-merge",
+        accessToken: "source-access-token",
+        accessTokenExpiresAt: new Date("2026-08-08T00:00:00.000Z"),
+        id: crypto.randomUUID(),
+        idToken: "source-id-token",
+        providerId: "github",
+        refreshToken: "source-refresh-token",
+        refreshTokenExpiresAt: new Date("2026-09-08T00:00:00.000Z"),
+        userId: source.userId,
+      });
+      const sourceAuthorization = await authorizeCode({
+        app,
+        identityCookie: source.cookie,
+        resource: "https://api.pledge.test",
+      });
+      const sourceTokenResponse = await exchangeAuthorizationCode({
+        app,
+        code: sourceAuthorization.code,
+        codeVerifier: sourceAuthorization.codeVerifier,
+        oidcSecret,
+        resource: "https://api.pledge.test",
+      });
+      expect(sourceTokenResponse.status).toBe(200);
+      const sourceToken = (await sourceTokenResponse.json()) as {
+        access_token: string;
+      };
+      const proof = await signInHostedWallet(
+        app,
+        config,
+        sourceWallet,
+        "/api/proof-auth",
+        "peezy-proof.session_token",
+      );
+      const cookies = `${survivor.cookie}; ${proof.cookie}`;
+      const previewResponse = await app.request(
+        "https://identity.test/v1/account-merges/proofs",
+        {
+          headers: { Cookie: cookies, Origin: config.baseUrl },
+          method: "POST",
+        },
+      );
+      expect(previewResponse.status).toBe(201);
+      const preview = (await previewResponse.json()) as { attemptId: string };
+      expect(
+        await database.db
+          .select({ status: identitySubjectMerge.status })
+          .from(identitySubjectMerge)
+          .where(eq(identitySubjectMerge.id, preview.attemptId)),
+      ).toEqual([{ status: "prepared" }]);
+      const commitResponse = await app.request(
+        "https://identity.test/v1/account-merges/commit",
+        {
+          body: JSON.stringify({ attemptId: preview.attemptId }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(commitResponse.status).toBe(200);
+      expect(await commitResponse.json()).toEqual({ merged: true });
+      expect(
+        await database.db
+          .select({ status: identitySubjectMerge.status })
+          .from(identitySubjectMerge)
+          .where(eq(identitySubjectMerge.id, preview.attemptId)),
+      ).toEqual([{ status: "committed" }]);
+      const [sourceRow] = await database.db
+        .select({ status: user.status })
+        .from(user)
+        .where(eq(user.id, source.userId));
+      expect(sourceRow?.status).toBe("merged");
+      const [sourceEmailRow] = await database.db
+        .select({ email: user.email })
+        .from(user)
+        .where(eq(user.id, source.userId));
+      expect(sourceEmailRow?.email).toMatch(/\.invalid$/);
+      const [mergedAccount] = await database.db
+        .select({
+          accessToken: account.accessToken,
+          accessTokenExpiresAt: account.accessTokenExpiresAt,
+          idToken: account.idToken,
+          refreshToken: account.refreshToken,
+          refreshTokenExpiresAt: account.refreshTokenExpiresAt,
+        })
+        .from(account)
+        .where(eq(account.accountId, "github-source-merge"));
+      expect(mergedAccount).toEqual({
+        accessToken: null,
+        accessTokenExpiresAt: null,
+        idToken: null,
+        refreshToken: null,
+        refreshTokenExpiresAt: null,
+      });
+      expect(
+        await database.db
+          .select()
+          .from(session)
+          .where(eq(session.userId, survivor.userId)),
+      ).toHaveLength(0);
+      expect(
+        await database.db
+          .select()
+          .from(session)
+          .where(eq(session.userId, source.userId)),
+      ).toHaveLength(0);
+      const sourceIntrospection = await app.request(
+        "https://identity.test/api/auth/oauth2/introspect",
+        {
+          body: new URLSearchParams({
+            token: sourceToken.access_token,
+            token_type_hint: "access_token",
+          }),
+          headers: {
+            Authorization: basic("pledge-cash", oidcSecret),
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          method: "POST",
+        },
+      );
+      expect(sourceIntrospection.status).toBe(200);
+      expect(await sourceIntrospection.json()).toMatchObject({
+        active: false,
+      });
+      expect(
+        (await identityMe(database.db, survivor.userId)).credentials,
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            address: sourceWallet.address.toLowerCase(),
+            kind: "wallet",
+          }),
+          expect.objectContaining({
+            kind: "email",
+            value: sourceEmail,
+            verified: true,
+          }),
+          expect.objectContaining({ kind: "social", provider: "github" }),
+        ]),
+      );
+    });
+
+    test("requires a recent proof-auth session before preparing consolidation", async () => {
+      const survivor = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0x1717171717171717171717171717171717171717171717171717171717171717",
+        ),
+      );
+      const source = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0x1818181818181818181818181818181818181818181818181818181818181818",
+        ),
+      );
+      const proof = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0x1818181818181818181818181818181818181818181818181818181818181818",
+        ),
+        "/api/proof-auth",
+        "peezy-proof.session_token",
+      );
+      await database.db
+        .update(session)
+        .set({ createdAt: new Date(Date.now() - 11 * 60_000) })
+        .where(eq(session.userId, source.userId));
+
+      const response = await app.request(
+        "https://identity.test/v1/account-merges/proofs",
+        {
+          headers: {
+            Cookie: `${survivor.cookie}; ${proof.cookie}`,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({
+        error: { code: "reauth_required" },
+      });
+    });
+
+    test("keeps a claimed parent while a wallet identity independently transitions to linked", async () => {
+      const survivorWallet = privateKeyToAccount(
+        "0x9999999999999999999999999999999999999999999999999999999999999999",
+      );
+      const survivor = await signInHostedWallet(app, config, survivorWallet);
+      await database.db.insert(walletPrincipal).values({
+        accountKind: "smart-account",
+        address: migratingWallet.address,
+        chainId: 1,
+        family: "evm",
+        id: crypto.randomUUID(),
+        signInEnabled: true,
+        userId: survivor.userId,
+      });
+      const accountResponse = await app.request(
+        "https://identity.test/account",
+        { headers: { Cookie: survivor.cookie } },
+      );
+      expect(accountResponse.status).toBe(200);
+      expect(accountResponse.headers.get("content-security-policy")).toContain(
+        "https://rpc.walletconnect.org",
+      );
+      const attemptResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/attempts",
+        {
+          headers: { Cookie: survivor.cookie, Origin: config.baseUrl },
+          method: "POST",
+        },
+      );
+      const attempt = (await attemptResponse.json()) as {
+        attemptId: string;
+        csrfToken: string;
+      };
+      const claimResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/claims",
+        {
+          body: JSON.stringify(attempt),
+          headers: {
+            Authorization: "Bearer wallet-bundle-token",
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(claimResponse.status).toBe(201);
+      expect(await claimResponse.json()).toMatchObject({
+        identities: [{ disposition: "needs_reverification" }],
+      });
+
+      const challengeResponse = await app.request(
+        "https://identity.test/v1/account/wallet/challenges",
+        {
+          body: JSON.stringify({
+            address: migratingWallet.address,
+            chainId: 999,
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(challengeResponse.status).toBe(201);
+      const challenge = (await challengeResponse.json()) as {
+        challengeId: string;
+        message: string;
+      };
+      const verifyResponse = await app.request(
+        "https://identity.test/v1/account/wallet/verify",
+        {
+          body: JSON.stringify({
+            ...challenge,
+            signature: await migratingWallet.signMessage({
+              message: challenge.message,
+            }),
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(verifyResponse.status).toBe(200);
+      const crossOriginClaimsResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/claims/current",
+        {
+          headers: {
+            Cookie: survivor.cookie,
+            Origin: "https://evil.test",
+          },
+        },
+      );
+      expect(crossOriginClaimsResponse.status).toBe(403);
+      const [pendingWalletIdentity] = await database.db
+        .select({ disposition: privyMigrationIdentity.disposition })
+        .from(privyMigrationIdentity)
+        .where(
+          eq(
+            privyMigrationIdentity.walletAddress,
+            migratingWallet.address.toLowerCase(),
+          ),
+        )
+        .limit(1);
+      expect(pendingWalletIdentity?.disposition).toBe("needs_reverification");
+      const claimsResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/claims/current",
+        {
+          headers: {
+            Cookie: survivor.cookie,
+            "Sec-Fetch-Site": "same-origin",
+          },
+        },
+      );
+      expect(await claimsResponse.json()).toMatchObject({
+        claims: [{ identities: [{ disposition: "linked" }] }],
+      });
+      expect(
+        await database.db
+          .select()
+          .from(privyMigrationClaim)
+          .where(
+            eq(
+              privyMigrationClaim.privyUserId,
+              "did:privy:legacy-wallet-person",
+            ),
+          ),
+      ).toHaveLength(1);
+    });
+
+    test("links a claimed Privy Solana identity with a fresh SIWS proof", async () => {
+      const survivor = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0x1212121212121212121212121212121212121212121212121212121212121212",
+        ),
+      );
+      const attemptResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/attempts",
+        {
+          headers: { Cookie: survivor.cookie, Origin: config.baseUrl },
+          method: "POST",
+        },
+      );
+      const attempt = (await attemptResponse.json()) as {
+        attemptId: string;
+        csrfToken: string;
+      };
+      const claimResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/claims",
+        {
+          body: JSON.stringify(attempt),
+          headers: {
+            Authorization: "Bearer solana-wallet-bundle-token",
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(claimResponse.status).toBe(201);
+      expect(await claimResponse.json()).toMatchObject({
+        identities: [
+          {
+            chainType: "solana",
+            disposition: "needs_reverification",
+            walletAddress: migratingSolanaWallet.address,
+          },
+        ],
+      });
+
+      const challengeResponse = await app.request(
+        "https://identity.test/v1/account/wallet/challenges",
+        {
+          body: JSON.stringify({
+            address: migratingSolanaWallet.address,
+            family: "solana",
+          }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(challengeResponse.status).toBe(201);
+      const challenge = (await challengeResponse.json()) as {
+        challengeId: string;
+        message: string;
+      };
+      const proofBody = JSON.stringify({
+        ...challenge,
+        signature: migratingSolanaWallet.sign(challenge.message),
+      });
+      const verifyResponse = await app.request(
+        "https://identity.test/v1/account/wallet/verify",
+        {
+          body: proofBody,
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(verifyResponse.status).toBe(200);
+      const replayResponse = await app.request(
+        "https://identity.test/v1/account/wallet/verify",
+        {
+          body: proofBody,
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(replayResponse.status).toBe(403);
+      expect(
+        (await identityMe(database.db, survivor.userId)).credentials,
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            address: migratingSolanaWallet.address,
+            family: "solana",
+            kind: "wallet",
+          }),
+        ]),
+      );
+      const claimsResponse = await app.request(
+        "https://identity.test/v1/migrations/privy/claims/current",
+        { headers: { Cookie: survivor.cookie, Origin: config.baseUrl } },
+      );
+      expect(await claimsResponse.json()).toMatchObject({
+        claims: [{ identities: [{ disposition: "linked" }] }],
+      });
+    });
+
+    test("invalidates and throttles failed account wallet proofs", async () => {
+      const wallet = privateKeyToAccount(
+        "0x1414141414141414141414141414141414141414141414141414141414141414",
+      );
+      const signedIn = await signInHostedWallet(app, config, wallet);
+      const challengeResponse = await app.request(
+        "https://identity.test/v1/account/wallet/challenges",
+        {
+          body: JSON.stringify({ address: wallet.address, chainId: 999 }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: signedIn.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(challengeResponse.status).toBe(201);
+      const challenge = (await challengeResponse.json()) as {
+        challengeId: string;
+        message: string;
+      };
+      const verify = (signature: string) =>
+        app.request("https://identity.test/v1/account/wallet/verify", {
+          body: JSON.stringify({ ...challenge, signature }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: signedIn.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        });
+
+      expect((await verify("0x00")).status).toBe(401);
+      const [failedChallenge] = await database.db
+        .select({ usedAt: accountWalletLinkChallenge.usedAt })
+        .from(accountWalletLinkChallenge)
+        .where(eq(accountWalletLinkChallenge.id, challenge.challengeId));
+      expect(failedChallenge?.usedAt).toBeInstanceOf(Date);
+      expect(
+        (await verify(await wallet.signMessage({ message: challenge.message })))
+          .status,
+      ).toBe(403);
+
+      const rateLimitKey = `identity-v1:account-wallet-verify:${signedIn.userId}`;
+      await database.db
+        .insert(rateLimit)
+        .values({ count: 10, key: rateLimitKey, lastRequest: Date.now() })
+        .onConflictDoUpdate({
+          set: { count: 10, lastRequest: Date.now() },
+          target: rateLimit.key,
+        });
+      expect((await verify("0x00")).status).toBe(429);
+      await database.db
+        .delete(rateLimit)
+        .where(eq(rateLimit.key, rateLimitKey));
+    });
+
+    test("uses SIWS as an isolated proof and consolidates its Solana subject", async () => {
+      const survivor = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(
+          "0x1313131313131313131313131313131313131313131313131313131313131313",
+        ),
+      );
+      const sourceWallet = createSolanaWallet();
+      const source = await signInSolanaWallet(app, config, sourceWallet);
+      const proof = await signInSolanaWallet(
+        app,
+        config,
+        sourceWallet,
+        "/api/proof-auth",
+        "peezy-proof.session_token",
+      );
+      const previewResponse = await app.request(
+        "https://identity.test/v1/account-merges/proofs",
+        {
+          headers: {
+            Cookie: `${survivor.cookie}; ${proof.cookie}`,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(previewResponse.status).toBe(201);
+      const preview = (await previewResponse.json()) as { attemptId: string };
+      const commitResponse = await app.request(
+        "https://identity.test/v1/account-merges/commit",
+        {
+          body: JSON.stringify({ attemptId: preview.attemptId }),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: survivor.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(commitResponse.status).toBe(200);
+      expect(
+        await database.db
+          .select({ userId: walletPrincipal.userId })
+          .from(walletPrincipal)
+          .where(eq(walletPrincipal.address, sourceWallet.address)),
+      ).toEqual([{ userId: survivor.userId }]);
+      expect(
+        await database.db
+          .select({ status: user.status })
+          .from(user)
+          .where(eq(user.id, source.userId)),
+      ).toEqual([{ status: "merged" }]);
     });
 
     test("creates one hosted wallet identity and refuses it after disablement", async () => {
@@ -804,6 +1912,227 @@ if (databaseUrl === undefined) {
       expect(disabledIssueResponse.status).toBe(403);
     });
 
+    test("serializes wallet grant issuance with account consolidation challenge revocation", async () => {
+      const sourceSubject = crypto.randomUUID();
+      const targetSubject = crypto.randomUUID();
+      const attemptId = crypto.randomUUID();
+      const principalId = crypto.randomUUID();
+      const raceWallet = privateKeyToAccount(
+        "0x1515151515151515151515151515151515151515151515151515151515151515",
+      );
+      const now = new Date("2026-08-07T00:00:00.000Z");
+      await database.db.insert(user).values([
+        {
+          createdAt: now,
+          email: `${sourceSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: sourceSubject,
+          name: "Grant Merge Source",
+          status: "active",
+          updatedAt: now,
+        },
+        {
+          createdAt: now,
+          email: `${targetSubject}@identity.peezy.tech.invalid`,
+          emailVerified: false,
+          id: targetSubject,
+          name: "Grant Merge Target",
+          status: "active",
+          updatedAt: now,
+        },
+      ]);
+      await database.db.insert(walletPrincipal).values({
+        accountKind: "eoa",
+        address: raceWallet.address,
+        createdAt: now,
+        family: "evm",
+        id: principalId,
+        signInEnabled: true,
+        updatedAt: now,
+        userId: sourceSubject,
+      });
+      await database.db.insert(identitySubjectMerge).values({
+        actorUserId: targetSubject,
+        expiresAt: new Date(Date.now() + 60_000),
+        id: attemptId,
+        metadata: {},
+        sourceUserId: sourceSubject,
+        status: "prepared",
+        targetUserId: targetSubject,
+      });
+      const challengeResponse = await app.request(
+        "https://identity.test/v1/wallet/challenges",
+        {
+          body: JSON.stringify({
+            chainId: 999,
+            clientId: "pledge-cash",
+            purpose: "link",
+            walletAddress: raceWallet.address,
+          }),
+          headers: { "Content-Type": "application/json", Origin: origin },
+          method: "POST",
+        },
+      );
+      expect(challengeResponse.status).toBe(201);
+      const challenge = WalletChallengeResponseSchema.parse(
+        await challengeResponse.json(),
+      );
+      const signature = await raceWallet.signMessage({
+        message: challenge.message,
+      });
+
+      await database.sql`
+        CREATE FUNCTION test_delay_wallet_principal_update()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+          PERFORM pg_sleep(0.5);
+          RETURN NEW;
+        END
+        $$
+      `;
+      await database.sql`
+        CREATE TRIGGER test_delay_wallet_principal_update
+        BEFORE UPDATE ON wallet_principal
+        FOR EACH ROW
+        EXECUTE FUNCTION test_delay_wallet_principal_update()
+      `;
+      try {
+        const mergePromise = commitAccountMerge({
+          attemptId,
+          db: database.db,
+          targetUserId: targetSubject,
+        });
+        let issuePromise: ReturnType<typeof createWalletGrant> | undefined;
+        let synchronizationFailure: unknown;
+        try {
+          const mergePid = await waitForDatabaseWaitEvent({
+            event: "PgSleep",
+            sqlClient: database.sql,
+          });
+          issuePromise = createWalletGrant({
+            clientId: "pledge-cash",
+            db: database.db,
+            message: challenge.message,
+            sessionSubject: sourceSubject,
+            signature,
+          });
+          await waitForBlockedBackend({
+            blockerPid: mergePid,
+            sqlClient: database.sql,
+          });
+        } catch (error) {
+          synchronizationFailure = error;
+        }
+        if (synchronizationFailure !== undefined) {
+          await Promise.allSettled([
+            mergePromise,
+            ...(issuePromise === undefined ? [] : [issuePromise]),
+          ]);
+          throw synchronizationFailure;
+        }
+        if (issuePromise === undefined) {
+          throw new Error("Wallet grant issuance was not started");
+        }
+
+        await expect(mergePromise).resolves.toEqual({ merged: true });
+        await expect(issuePromise).rejects.toMatchObject({
+          message: "Identity account is unavailable",
+          status: 403,
+        });
+        expect(
+          await database.db
+            .select({ id: walletPrincipal.id, userId: walletPrincipal.userId })
+            .from(walletPrincipal)
+            .where(eq(walletPrincipal.id, principalId)),
+        ).toEqual([{ id: principalId, userId: targetSubject }]);
+        expect(
+          await database.db
+            .select({ nonce: walletChallenge.nonce })
+            .from(walletChallenge)
+            .where(eq(walletChallenge.nonce, challenge.nonce)),
+        ).toHaveLength(0);
+        expect(
+          await database.db
+            .select({ id: walletGrant.id })
+            .from(walletGrant)
+            .where(eq(walletGrant.userId, sourceSubject)),
+        ).toHaveLength(0);
+        expect(
+          await database.db
+            .select({ status: user.status })
+            .from(user)
+            .where(eq(user.id, sourceSubject)),
+        ).toEqual([{ status: "merged" }]);
+      } finally {
+        await database.sql`
+          DROP TRIGGER IF EXISTS test_delay_wallet_principal_update
+          ON wallet_principal
+        `;
+        await database.sql`
+          DROP FUNCTION IF EXISTS test_delay_wallet_principal_update()
+        `;
+      }
+    });
+
+    test("refuses to exchange a grant after its subject is disabled", async () => {
+      const disabledSubject = crypto.randomUUID();
+      const disabledWallet = privateKeyToAccount(
+        "0x1616161616161616161616161616161616161616161616161616161616161616",
+      );
+      const now = new Date("2026-08-07T00:01:00.000Z");
+      await database.db.insert(user).values({
+        createdAt: now,
+        email: "disabled-grant@example.com",
+        emailVerified: true,
+        id: disabledSubject,
+        name: "Disabled Grant",
+        status: "active",
+        updatedAt: now,
+      });
+      const issueResponse = await issueWalletLinkGrant({
+        app,
+        appSecret,
+        origin,
+        subject: disabledSubject,
+        wallet: disabledWallet,
+      });
+      expect(issueResponse.status).toBe(201);
+      const issued = WalletGrantResponseSchema.parse(
+        await issueResponse.json(),
+      );
+
+      await database.db
+        .update(user)
+        .set({ status: "disabled", updatedAt: new Date() })
+        .where(eq(user.id, disabledSubject));
+      const exchangeResponse = await app.request(
+        "https://identity.test/v1/wallet/grants/exchange",
+        {
+          body: JSON.stringify({
+            clientId: "pledge-cash",
+            grant: issued.grant,
+          }),
+          headers: {
+            Authorization: basic("pledge-cash", appSecret),
+            "Content-Type": "application/json",
+          },
+          method: "POST",
+        },
+      );
+      expect(exchangeResponse.status).toBe(401);
+      expect(await exchangeResponse.json()).toMatchObject({
+        error: { message: "Wallet grant is invalid or expired" },
+      });
+      expect(
+        await database.db
+          .select({ consumedAt: walletGrant.consumedAt })
+          .from(walletGrant)
+          .where(eq(walletGrant.userId, disabledSubject)),
+      ).toEqual([{ consumedAt: null }]);
+    });
+
     test("keeps ambient sign-in separate and requires an explicit authenticated link", async () => {
       const ambientSignInWallet = privateKeyToAccount(
         "0x2222222222222222222222222222222222222222222222222222222222222222",
@@ -1270,6 +2599,94 @@ function bunServer(address: string): {
   };
 }
 
+async function issueWalletLinkGrant(input: {
+  app: ReturnType<typeof createIdentityApp>;
+  appSecret: string;
+  origin: string;
+  subject: string;
+  wallet: {
+    address: `0x${string}`;
+    signMessage(input: { message: string }): Promise<`0x${string}`>;
+  };
+}): Promise<Response> {
+  const challengeResponse = await input.app.request(
+    "https://identity.test/v1/wallet/challenges",
+    {
+      body: JSON.stringify({
+        chainId: 999,
+        clientId: "pledge-cash",
+        purpose: "link",
+        walletAddress: input.wallet.address,
+      }),
+      headers: {
+        "Content-Type": "application/json",
+        Origin: input.origin,
+      },
+      method: "POST",
+    },
+  );
+  expect(challengeResponse.status).toBe(201);
+  const challenge = WalletChallengeResponseSchema.parse(
+    await challengeResponse.json(),
+  );
+  return input.app.request("https://identity.test/v1/wallet/grants/issue", {
+    body: JSON.stringify({
+      clientId: "pledge-cash",
+      message: challenge.message,
+      signature: await input.wallet.signMessage({
+        message: challenge.message,
+      }),
+      subject: input.subject,
+    }),
+    headers: {
+      Authorization: basic("pledge-cash", input.appSecret),
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+}
+
+async function waitForBlockedBackend(input: {
+  blockerPid: number;
+  sqlClient: ReturnType<typeof postgres>;
+}): Promise<number> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    const [activity] = await input.sqlClient<{ pid: number }[]>`
+      SELECT pid
+      FROM pg_stat_activity
+      WHERE pid <> pg_backend_pid()
+        AND datname = current_database()
+        AND wait_event_type = 'Lock'
+        AND ${input.blockerPid} = ANY(pg_blocking_pids(pid))
+      LIMIT 1
+    `;
+    if (activity !== undefined) return activity.pid;
+    await Bun.sleep(5);
+  }
+  throw new Error(`No database backend waited for blocker ${input.blockerPid}`);
+}
+
+async function waitForDatabaseWaitEvent(input: {
+  event: string;
+  sqlClient: ReturnType<typeof postgres>;
+}): Promise<number> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    const [activity] = await input.sqlClient<{ pid: number }[]>`
+      SELECT pid
+      FROM pg_stat_activity
+      WHERE pid <> pg_backend_pid()
+        AND datname = current_database()
+        AND wait_event = ${input.event}
+      LIMIT 1
+    `;
+    if (activity !== undefined) return activity.pid;
+    await Bun.sleep(5);
+  }
+  throw new Error(`No database backend entered ${input.event}`);
+}
+
 async function authorizeCode(input: {
   app: ReturnType<typeof createIdentityApp>;
   identityCookie: string;
@@ -1378,4 +2795,103 @@ function responseCookie(response: Response, name: string): string {
     }
   }
   throw new Error(`Expected ${name} cookie`);
+}
+
+async function signInHostedWallet(
+  app: ReturnType<typeof createIdentityApp>,
+  config: IdentityConfig,
+  wallet: {
+    address: `0x${string}`;
+    signMessage(input: { message: string }): Promise<`0x${string}`>;
+  },
+  basePath = "/api/auth",
+  cookieName = "peezy-identity.session_token",
+): Promise<{ cookie: string; userId: string }> {
+  const chainId = 999;
+  const nonceResponse = await app.request(
+    `${config.baseUrl}${basePath}/siwe/nonce`,
+    {
+      body: JSON.stringify({ chainId, walletAddress: wallet.address }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+  );
+  expect(nonceResponse.status).toBe(200);
+  const { nonce } = (await nonceResponse.json()) as { nonce: string };
+  const now = new Date();
+  const message = createSiweMessage({
+    address: wallet.address,
+    chainId,
+    domain: new URL(config.baseUrl).host,
+    expirationTime: new Date(now.getTime() + 10 * 60_000),
+    issuedAt: now,
+    nonce,
+    statement: HOSTED_WALLET_STATEMENT,
+    uri: config.baseUrl,
+    version: "1",
+  });
+  const response = await app.request(
+    `${config.baseUrl}${basePath}/siwe/verify`,
+    {
+      body: JSON.stringify({
+        chainId,
+        message,
+        signature: await wallet.signMessage({ message }),
+        walletAddress: wallet.address,
+      }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+  );
+  expect(response.status).toBe(200);
+  const body = (await response.json()) as { user: { id: string } };
+  return { cookie: responseCookie(response, cookieName), userId: body.user.id };
+}
+
+type TestSolanaWallet = ReturnType<typeof createSolanaWallet>;
+
+function createSolanaWallet() {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const spki = publicKey.export({ format: "der", type: "spki" });
+  return {
+    address: bs58.encode(spki.subarray(-32)),
+    sign: (message: string) =>
+      sign(null, Buffer.from(message, "utf8"), privateKey).toString("base64"),
+  };
+}
+
+async function signInSolanaWallet(
+  app: ReturnType<typeof createIdentityApp>,
+  config: IdentityConfig,
+  wallet: TestSolanaWallet,
+  basePath = "/api/auth",
+  cookieName = "peezy-identity.session_token",
+): Promise<{ cookie: string; userId: string }> {
+  const challengeResponse = await app.request(
+    `${config.baseUrl}${basePath}/siws/challenge`,
+    {
+      body: JSON.stringify({ address: wallet.address }),
+      headers: { "Content-Type": "application/json", Origin: config.baseUrl },
+      method: "POST",
+    },
+  );
+  expect(challengeResponse.status).toBe(200);
+  const challenge = (await challengeResponse.json()) as {
+    challengeId: string;
+    message: string;
+  };
+  const response = await app.request(
+    `${config.baseUrl}${basePath}/siws/verify`,
+    {
+      body: JSON.stringify({
+        ...challenge,
+        signature: wallet.sign(challenge.message),
+      }),
+      headers: { "Content-Type": "application/json", Origin: config.baseUrl },
+      method: "POST",
+    },
+  );
+  expect(response.status).toBe(200);
+  const body = (await response.json()) as { user: { id: string } };
+  return { cookie: responseCookie(response, cookieName), userId: body.user.id };
 }

@@ -3,10 +3,11 @@ import { resolve } from "node:path";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 
 import { createIdentityApp } from "./app";
-import { createIdentityAuth } from "./auth";
+import { createIdentityAuth, createIdentityProofAuth } from "./auth";
 import { seedConfiguredClients } from "./clients";
 import { loadConfig } from "./config";
 import { createDbClient } from "./db/client";
+import { createPrivyGateway } from "./privy-migration";
 
 const config = loadConfig();
 const database = createDbClient(config.databaseUrl);
@@ -17,10 +18,15 @@ await migrate(db, { migrationsFolder });
 await seedConfiguredClients(db, config);
 
 const { auth, socialProviderNames } = createIdentityAuth(config, db);
+const proofAuth = createIdentityProofAuth(config, db);
 const app = createIdentityApp({
   auth,
   config,
   db,
+  ...(config.privyMigration === undefined
+    ? {}
+    : { privyGateway: createPrivyGateway(config.privyMigration) }),
+  proofAuth,
   socialProviderNames,
 });
 

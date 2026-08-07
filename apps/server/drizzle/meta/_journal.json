@@ -64,6 +64,13 @@
       "when": 1785342937498,
       "tag": "0008_magical_amazoness",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1786042642912,
+      "tag": "0009_flimsy_red_ghost",
+      "breakpoints": true
     }
   ]
 }

@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   IdentityMeResponseSchema,
   PeezyUserSchema,
+  SolanaAddressSchema,
   WalletCredentialSchema,
 } from "../src/contracts";
 
@@ -76,5 +77,24 @@ describe("identity contracts", () => {
         verifiedChainIds: [1],
       }),
     ).toThrow("Smart-account credentials must be chain scoped");
+  });
+
+  test("preserves case-sensitive Solana wallet addresses", () => {
+    const address = "Vote111111111111111111111111111111111111111";
+    expect(
+      WalletCredentialSchema.parse({
+        accountKind: "eoa",
+        address,
+        family: "solana",
+        id: "715f5baa-cd86-4a98-a1fe-3dd930f5d5d4",
+        kind: "wallet",
+        linkedAt: "2026-07-29T00:00:00.000Z",
+        signInEnabled: true,
+      }).address,
+    ).toBe(address);
+  });
+
+  test("rejects base58 strings that are not 32-byte public keys", () => {
+    expect(SolanaAddressSchema.safeParse("A".repeat(32)).success).toBe(false);
   });
 });

@@ -42,6 +42,15 @@ export type IdentityCredential =
       linkedAt: string;
       signInEnabled: boolean;
       verifiedChainIds: number[];
+    }
+  | {
+      accountKind: "eoa";
+      address: string;
+      family: "solana";
+      id: string;
+      kind: "wallet";
+      linkedAt: string;
+      signInEnabled: boolean;
     };
 
 export type IdentityMeResponse = {

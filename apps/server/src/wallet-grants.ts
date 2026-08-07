@@ -224,6 +224,67 @@ export async function createWalletGrant(input: {
       sql`SELECT pg_advisory_xact_lock(hashtext(${`wallet-principal:evm:${normalizedAddress}`}))`,
     );
 
+    const [principalCandidate] = await tx
+      .select()
+      .from(walletPrincipal)
+      .where(
+        and(
+          eq(walletPrincipal.accountKind, "eoa"),
+          eq(walletPrincipal.family, "evm"),
+          sql`lower(${walletPrincipal.address}) = ${normalizedAddress}`,
+        ),
+      )
+      .limit(1);
+
+    if (challenge.purpose === "link" && input.sessionSubject === undefined) {
+      throw new WalletGrantError(
+        401,
+        "An authenticated identity session is required to link a wallet",
+      );
+    }
+    const linkSubject =
+      challenge.purpose === "link" ? input.sessionSubject : undefined;
+    if (
+      linkSubject !== undefined &&
+      principalCandidate !== undefined &&
+      principalCandidate.userId !== linkSubject
+    ) {
+      throw new WalletGrantError(
+        409,
+        "Wallet is already linked to another account",
+      );
+    }
+
+    let subject = linkSubject ?? principalCandidate?.userId;
+    if (subject !== undefined) {
+      const [existingUser] = await tx
+        .select()
+        .from(user)
+        .where(eq(user.id, subject))
+        .for("update")
+        .limit(1);
+      if (existingUser === undefined || existingUser.status !== "active") {
+        throw new WalletGrantError(403, "Identity account is unavailable");
+      }
+    } else {
+      subject = randomUUID();
+      const checksumAddress = getAddress(challenge.address);
+      await tx.insert(user).values({
+        createdAt: now,
+        email: walletEmail(checksumAddress),
+        emailVerified: false,
+        id: subject,
+        name: checksumAddress,
+        status: "active",
+        updatedAt: now,
+      });
+    }
+
+    // Account consolidation locks user rows before it moves principals and
+    // deletes their challenges and grants. Keep the same order here: the
+    // preliminary principal read identifies the subject, the user row
+    // establishes the lifecycle boundary, and only then do we mutate the
+    // challenge or lock and revalidate the principal.
     const consumed = await tx
       .update(walletChallenge)
       .set({ usedAt: now })
@@ -245,29 +306,17 @@ export async function createWalletGrant(input: {
       .where(
         and(
           eq(walletPrincipal.accountKind, "eoa"),
+          eq(walletPrincipal.family, "evm"),
           sql`lower(${walletPrincipal.address}) = ${normalizedAddress}`,
         ),
       )
       .for("update")
       .limit(1);
-
-    if (challenge.purpose === "link" && input.sessionSubject === undefined) {
-      throw new WalletGrantError(
-        401,
-        "An authenticated identity session is required to link a wallet",
-      );
-    }
-    const linkSubject =
-      challenge.purpose === "link" ? input.sessionSubject : undefined;
     if (
-      linkSubject !== undefined &&
       existingPrincipal !== undefined &&
-      existingPrincipal.userId !== linkSubject
+      existingPrincipal.userId !== subject
     ) {
-      throw new WalletGrantError(
-        409,
-        "Wallet is already linked to another account",
-      );
+      throw new WalletGrantError(409, "Wallet ownership changed; try again");
     }
     if (
       challenge.purpose === "sign-in" &&
@@ -278,30 +327,6 @@ export async function createWalletGrant(input: {
         403,
         "Wallet sign-in is disabled for this credential",
       );
-    }
-
-    let subject = linkSubject ?? existingPrincipal?.userId;
-    if (subject !== undefined) {
-      const [existingUser] = await tx
-        .select()
-        .from(user)
-        .where(eq(user.id, subject))
-        .limit(1);
-      if (existingUser === undefined || existingUser.status !== "active") {
-        throw new WalletGrantError(403, "Identity account is unavailable");
-      }
-    } else {
-      subject = randomUUID();
-      const checksumAddress = getAddress(challenge.address);
-      await tx.insert(user).values({
-        createdAt: now,
-        email: walletEmail(checksumAddress),
-        emailVerified: false,
-        id: subject,
-        name: checksumAddress,
-        status: "active",
-        updatedAt: now,
-      });
     }
 
     let principalId = existingPrincipal?.id;
@@ -399,24 +424,55 @@ export async function exchangeWalletGrant(input: {
   now?: Date;
 }): Promise<{ expiresAt: string; subject: string }> {
   const now = input.now ?? new Date();
-  const [consumed] = await input.db
-    .update(walletGrant)
-    .set({ consumedAt: now })
-    .where(
-      and(
-        eq(walletGrant.clientId, input.clientId),
-        eq(walletGrant.grantHash, opaqueHash(input.grant)),
-        isNull(walletGrant.consumedAt),
-        gt(walletGrant.expiresAt, now),
-      ),
-    )
-    .returning({
-      expiresAt: walletGrant.expiresAt,
-      subject: walletGrant.userId,
-    });
-  if (consumed === undefined) {
-    throw new WalletGrantError(401, "Wallet grant is invalid or expired");
-  }
+  const consumed = await input.db.transaction(async (transaction) => {
+    const grantHash = opaqueHash(input.grant);
+    const [candidate] = await transaction
+      .select({ subject: walletGrant.userId })
+      .from(walletGrant)
+      .where(
+        and(
+          eq(walletGrant.clientId, input.clientId),
+          eq(walletGrant.grantHash, grantHash),
+          isNull(walletGrant.consumedAt),
+          gt(walletGrant.expiresAt, now),
+        ),
+      )
+      .limit(1);
+    if (candidate === undefined) {
+      throw new WalletGrantError(401, "Wallet grant is invalid or expired");
+    }
+
+    const [identityUser] = await transaction
+      .select({ status: user.status })
+      .from(user)
+      .where(eq(user.id, candidate.subject))
+      .for("update")
+      .limit(1);
+    if (identityUser?.status !== "active") {
+      throw new WalletGrantError(401, "Wallet grant is invalid or expired");
+    }
+
+    const [result] = await transaction
+      .update(walletGrant)
+      .set({ consumedAt: now })
+      .where(
+        and(
+          eq(walletGrant.clientId, input.clientId),
+          eq(walletGrant.grantHash, grantHash),
+          eq(walletGrant.userId, candidate.subject),
+          isNull(walletGrant.consumedAt),
+          gt(walletGrant.expiresAt, now),
+        ),
+      )
+      .returning({
+        expiresAt: walletGrant.expiresAt,
+        subject: walletGrant.userId,
+      });
+    if (result === undefined) {
+      throw new WalletGrantError(401, "Wallet grant is invalid or expired");
+    }
+    return result;
+  });
   return {
     expiresAt: consumed.expiresAt.toISOString(),
     subject: consumed.subject,

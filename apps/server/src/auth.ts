@@ -3,8 +3,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { betterAuth, type BetterAuthPlugin } from "better-auth";
+import { APIError } from "better-auth/api";
 import { genericOAuth, jwt, siwe } from "better-auth/plugins";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   createRemoteJWKSet,
   jwtVerify,
@@ -22,6 +23,7 @@ import type { IdentityConfig, SocialProviderName } from "./config";
 import type { IdentityDb } from "./db/client";
 import * as schema from "./db/schema";
 import { sessionHandoffPlugin } from "./session-handoffs";
+import { solanaAuthPlugin } from "./solana-auth";
 
 const TELEGRAM_ISSUER = "https://oauth.telegram.org";
 const TELEGRAM_DISCOVERY_URL = `${TELEGRAM_ISSUER}/.well-known/openid-configuration`;
@@ -33,7 +35,25 @@ type TelegramOAuthTokens = {
   idToken?: string | undefined;
 };
 
+type IdentityAuthMode = "primary" | "proof";
+
 export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
+  return createConfiguredIdentityAuth(config, db, "primary");
+}
+
+export function createIdentityProofAuth(
+  config: IdentityConfig,
+  db: IdentityDb,
+) {
+  return createConfiguredIdentityAuth(config, db, "proof").auth;
+}
+
+function createConfiguredIdentityAuth(
+  config: IdentityConfig,
+  db: IdentityDb,
+  mode: IdentityAuthMode,
+) {
+  const proofOnly = mode === "proof";
   const secureCookies = new URL(config.baseUrl).protocol === "https:";
   const socialProviderNames = configuredSocialProviders(config.socialProviders);
   const github = config.socialProviders.github;
@@ -51,6 +71,7 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
                 authentication: "basic",
                 clientId: telegram.clientId,
                 clientSecret: telegram.clientSecret,
+                disableSignUp: proofOnly,
                 discoveryUrl: TELEGRAM_DISCOVERY_URL,
                 getUserInfo: (tokens) =>
                   telegramUserInfo(tokens, telegram.clientId),
@@ -89,11 +110,12 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
 
   const auth = betterAuth({
     appName: "peezy.tech",
-    basePath: "/api/auth",
+    basePath: proofOnly ? "/api/proof-auth" : "/api/auth",
     baseURL: config.baseUrl,
     secret: config.secret,
     trustedOrigins: [config.baseUrl, ...config.trustedOrigins],
-    database: createIdentityDatabaseAdapter(db),
+    database: createIdentityDatabaseAdapter(db, proofOnly, socialProviderNames),
+    disabledPaths: ["/unlink-account"],
     user: {
       additionalFields: {
         status: {
@@ -102,6 +124,15 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
           required: true,
           type: "string",
         },
+      },
+    },
+    verification: {
+      storeIdentifier: {
+        hash: async (identifier) =>
+          createHash("sha256")
+            .update(`peezy-identity-verification:${mode}\0`)
+            .update(identifier)
+            .digest("hex"),
       },
     },
     account: {
@@ -119,23 +150,6 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
     databaseHooks: {
       account: {
         create: {
-          after: async (createdAccount) => {
-            if (
-              !socialProviderNames.includes(
-                createdAccount.providerId as SocialProviderName,
-              )
-            ) {
-              return;
-            }
-            await db.insert(schema.identityAuditEvent).values({
-              actorUserId: createdAccount.userId,
-              credentialId: createdAccount.id,
-              id: crypto.randomUUID(),
-              kind: "social.linked",
-              metadata: { provider: createdAccount.providerId },
-              userId: createdAccount.userId,
-            });
-          },
           before: async (account) => ({ data: { ...account, idToken: null } }),
         },
         update: {
@@ -155,6 +169,7 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
         : {
             discord: {
               ...discord,
+              disableSignUp: proofOnly,
               disableDefaultScope: true,
               mapProfileToUser: (profile) => ({
                 email: socialProviderEmail("discord", profile.id),
@@ -162,12 +177,15 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
               scope: ["identify"],
             },
           }),
-      ...(github === undefined ? {} : { github }),
+      ...(github === undefined
+        ? {}
+        : { github: { ...github, disableSignUp: proofOnly } }),
       ...(apple === undefined
         ? {}
         : {
             apple: {
               ...apple,
+              disableSignUp: proofOnly,
               disableIdTokenSignIn: true,
             },
           }),
@@ -176,6 +194,7 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
         : {
             twitter: {
               ...twitter,
+              disableSignUp: proofOnly,
               disableDefaultScope: true,
               mapProfileToUser: (profile) => ({
                 email: socialProviderEmail("twitter", profile.data.id),
@@ -185,7 +204,7 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
           }),
     },
     advanced: {
-      cookiePrefix: "peezy-identity",
+      cookiePrefix: proofOnly ? "peezy-proof" : "peezy-identity",
       database: { generateId: "uuid" },
       defaultCookieAttributes: {
         sameSite: secureCookies ? "none" : "lax",
@@ -201,11 +220,15 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
     },
     telemetry: { enabled: false },
     plugins: [
-      jwt({
-        jwt: {
-          issuer: `${config.baseUrl}/api/auth`,
-        },
-      }),
+      ...(proofOnly
+        ? []
+        : [
+            jwt({
+              jwt: {
+                issuer: `${config.baseUrl}/api/auth`,
+              },
+            }),
+          ]),
       ...telegramPlugins,
       siwe({
         anonymous: true,
@@ -220,61 +243,324 @@ export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
             signature,
           }),
       }),
-      sessionHandoffPlugin(db, config),
-      providerPlugin,
+      solanaAuthPlugin(db, config, mode),
+      ...(proofOnly ? [] : [sessionHandoffPlugin(db, config), providerPlugin]),
     ],
   });
 
   return { auth, socialProviderNames };
 }
 
-function createIdentityDatabaseAdapter(db: IdentityDb) {
-  const createAdapter = drizzleAdapter(db, {
+function createIdentityDatabaseAdapter(
+  db: IdentityDb,
+  proofOnly = false,
+  socialProviderNames: readonly SocialProviderName[] = [],
+) {
+  const createRootAdapter = drizzleAdapter(db, {
     provider: "pg",
     schema,
   });
 
-  return (...args: Parameters<typeof createAdapter>) => {
-    const adapter = createAdapter(...args);
-    return {
-      ...adapter,
-      findOne: async (...findOneArgs: Parameters<typeof adapter.findOne>) => {
-        const [input] = findOneArgs;
-        const result = await adapter.findOne({
-          ...input,
-          ...(input.model === "walletAddress" && input.where !== undefined
-            ? {
-                where: input.where.map((condition) =>
-                  condition.field === "address"
-                    ? { ...condition, mode: "insensitive" }
-                    : condition,
-                ),
-              }
-            : {}),
+  return (...args: Parameters<typeof createRootAdapter>) => {
+    type Adapter = ReturnType<typeof createRootAdapter>;
+    type AdapterDb =
+      | IdentityDb
+      | Parameters<Parameters<IdentityDb["transaction"]>[0]>[0];
+    type GuardedModel = "account" | "oauthConsent" | "walletAddress";
+    type GuardedRow = { id: string; userId: string | null };
+
+    const isGuardedModel = (model: string): model is GuardedModel =>
+      model === "account" ||
+      model === "oauthConsent" ||
+      model === "walletAddress";
+    const guardedUserIds = (rows: GuardedRow[]): string[] =>
+      rows.flatMap((row) =>
+        typeof row.userId === "string" ? [row.userId] : [],
+      );
+
+    const createAdapter = (adapterDb: AdapterDb): Adapter =>
+      drizzleAdapter(adapterDb, {
+        provider: "pg",
+        schema,
+      })(...args);
+
+    // Account consolidation takes these same user locks before moving or
+    // revoking credentials. Rechecking existing account ownership after the
+    // lock makes the credential write linearizable with that lifecycle.
+    const withActiveAccountUsers = async <Result>(input: {
+      accountRows: GuardedRow[];
+      adapterDb: AdapterDb;
+      model: GuardedModel;
+      operation: (adapter: Adapter, adapterDb: AdapterDb) => Promise<Result>;
+      userIds: string[];
+    }): Promise<Result> => {
+      const userIds = [...new Set(input.userIds)].sort();
+      if (userIds.length === 0) {
+        return input.operation(createAdapter(input.adapterDb), input.adapterDb);
+      }
+      const lockedUsers = await input.adapterDb
+        .select({ id: schema.user.id, status: schema.user.status })
+        .from(schema.user)
+        .where(inArray(schema.user.id, userIds))
+        .orderBy(schema.user.id)
+        .for("update");
+      if (
+        lockedUsers.length !== userIds.length ||
+        lockedUsers.some((lockedUser) => lockedUser.status !== "active")
+      ) {
+        throw unavailableIdentityAccount();
+      }
+
+      const adapter = createAdapter(input.adapterDb);
+      if (input.accountRows.length > 0) {
+        const expectedOwners = new Map(
+          input.accountRows.map((accountRow) => [
+            accountRow.id,
+            accountRow.userId,
+          ]),
+        );
+        const accountRows = await adapter.findMany<{
+          id: string;
+          userId: string | null;
+        }>({
+          model: input.model,
+          select: ["id", "userId"],
+          where: [
+            {
+              field: "id",
+              operator: "in",
+              value: [...expectedOwners.keys()],
+            },
+          ],
         });
         if (
-          (input.model === "user" && isDisabledIdentityUser(result)) ||
-          (input.model === "session" &&
-            isDisabledIdentityUser((result as { user?: unknown } | null)?.user))
+          accountRows.length !== expectedOwners.size ||
+          accountRows.some(
+            (accountRow) =>
+              expectedOwners.get(accountRow.id) !== accountRow.userId,
+          )
         ) {
-          return null;
+          throw unavailableIdentityAccount();
         }
-        return result;
-      },
-      findMany: async (
-        ...findManyArgs: Parameters<typeof adapter.findMany>
-      ) => {
-        const [input] = findManyArgs;
-        const results = await adapter.findMany(input);
-        return input.model === "session"
-          ? results.filter(
-              (result) =>
-                !isDisabledIdentityUser((result as { user?: unknown }).user),
-            )
-          : results;
-      },
+      }
+
+      return input.operation(adapter, input.adapterDb);
     };
+
+    const createWrappedAdapter = (
+      adapterDb: AdapterDb,
+      inTransaction: boolean,
+    ): Adapter => {
+      const adapter = createAdapter(adapterDb);
+      const runGuarded = async <Result>(input: {
+        accountRows: GuardedRow[];
+        model: GuardedModel;
+        operation: (adapter: Adapter, adapterDb: AdapterDb) => Promise<Result>;
+        userIds: string[];
+      }): Promise<Result> => {
+        if (inTransaction) {
+          return withActiveAccountUsers({ ...input, adapterDb });
+        }
+        return adapterDb.transaction((transaction) =>
+          withActiveAccountUsers({ ...input, adapterDb: transaction }),
+        );
+      };
+
+      const wrappedAdapter = {
+        ...adapter,
+        create: async (...createArgs: Parameters<typeof adapter.create>) => {
+          const [input] = createArgs;
+          if (proofOnly && input.model === "user") {
+            throw new Error("Proof authentication cannot create an account");
+          }
+          if (!isGuardedModel(input.model)) {
+            return adapter.create(...createArgs);
+          }
+          const userId = input.data.userId;
+          if (typeof userId !== "string") {
+            if (input.model === "oauthConsent") {
+              return adapter.create(...createArgs);
+            }
+            throw unavailableIdentityAccount();
+          }
+          return runGuarded({
+            accountRows: [],
+            model: input.model,
+            operation: async (transactionAdapter, transactionDb) => {
+              const createdAccount = await transactionAdapter.create(
+                ...createArgs,
+              );
+              if (
+                input.model === "account" &&
+                !proofOnly &&
+                typeof createdAccount === "object" &&
+                createdAccount !== null &&
+                "id" in createdAccount &&
+                typeof createdAccount.id === "string" &&
+                "providerId" in createdAccount &&
+                typeof createdAccount.providerId === "string" &&
+                socialProviderNames.includes(
+                  createdAccount.providerId as SocialProviderName,
+                )
+              ) {
+                // Keep the immutable link audit in the credential transaction;
+                // an after hook would run only after this lifecycle lock ends.
+                await transactionDb.insert(schema.identityAuditEvent).values({
+                  actorUserId: userId,
+                  credentialId: createdAccount.id,
+                  id: crypto.randomUUID(),
+                  kind: "social.linked",
+                  metadata: { provider: createdAccount.providerId },
+                  userId,
+                });
+              }
+              return createdAccount;
+            },
+            userIds: [userId],
+          });
+        },
+        findOne: async (...findOneArgs: Parameters<typeof adapter.findOne>) => {
+          const [input] = findOneArgs;
+          const result = await adapter.findOne({
+            ...input,
+            ...(input.model === "walletAddress" && input.where !== undefined
+              ? {
+                  where: input.where.map((condition) =>
+                    condition.field === "address"
+                      ? { ...condition, mode: "insensitive" }
+                      : condition,
+                  ),
+                }
+              : {}),
+          });
+          if (
+            (input.model === "user" && isDisabledIdentityUser(result)) ||
+            (input.model === "session" &&
+              isDisabledIdentityUser(
+                (result as { user?: unknown } | null)?.user,
+              ))
+          ) {
+            return null;
+          }
+          return result;
+        },
+        findMany: async (
+          ...findManyArgs: Parameters<typeof adapter.findMany>
+        ) => {
+          const [input] = findManyArgs;
+          const results = await adapter.findMany(input);
+          return input.model === "session"
+            ? results.filter(
+                (result) =>
+                  !isDisabledIdentityUser((result as { user?: unknown }).user),
+              )
+            : results;
+        },
+        delete: async (...deleteArgs: Parameters<typeof adapter.delete>) => {
+          const [input] = deleteArgs;
+          if (!isGuardedModel(input.model)) {
+            return adapter.delete(...deleteArgs);
+          }
+          const accountRows = await adapter.findMany<{
+            id: string;
+            userId: string | null;
+          }>({
+            model: input.model,
+            select: ["id", "userId"],
+            where: input.where,
+          });
+          return runGuarded({
+            accountRows,
+            model: input.model,
+            operation: (transactionAdapter) =>
+              transactionAdapter.delete(...deleteArgs),
+            userIds: guardedUserIds(accountRows),
+          });
+        },
+        deleteMany: async (
+          ...deleteManyArgs: Parameters<typeof adapter.deleteMany>
+        ) => {
+          const [input] = deleteManyArgs;
+          if (!isGuardedModel(input.model)) {
+            return adapter.deleteMany(...deleteManyArgs);
+          }
+          const accountRows = await adapter.findMany<{
+            id: string;
+            userId: string | null;
+          }>({
+            model: input.model,
+            select: ["id", "userId"],
+            where: input.where,
+          });
+          return runGuarded({
+            accountRows,
+            model: input.model,
+            operation: (transactionAdapter) =>
+              transactionAdapter.deleteMany(...deleteManyArgs),
+            userIds: guardedUserIds(accountRows),
+          });
+        },
+        update: async (...updateArgs: Parameters<typeof adapter.update>) => {
+          const [input] = updateArgs;
+          if (!isGuardedModel(input.model)) {
+            return adapter.update(...updateArgs);
+          }
+          const accountRows = await adapter.findMany<{
+            id: string;
+            userId: string | null;
+          }>({
+            model: input.model,
+            select: ["id", "userId"],
+            where: input.where,
+          });
+          return runGuarded({
+            accountRows,
+            model: input.model,
+            operation: (transactionAdapter) =>
+              transactionAdapter.update(...updateArgs),
+            userIds: guardedUserIds(accountRows),
+          });
+        },
+        updateMany: async (
+          ...updateManyArgs: Parameters<typeof adapter.updateMany>
+        ) => {
+          const [input] = updateManyArgs;
+          if (!isGuardedModel(input.model)) {
+            return adapter.updateMany(...updateManyArgs);
+          }
+          const accountRows = await adapter.findMany<{
+            id: string;
+            userId: string | null;
+          }>({
+            model: input.model,
+            select: ["id", "userId"],
+            where: input.where,
+          });
+          return runGuarded({
+            accountRows,
+            model: input.model,
+            operation: (transactionAdapter) =>
+              transactionAdapter.updateMany(...updateManyArgs),
+            userIds: guardedUserIds(accountRows),
+          });
+        },
+        transaction: (callback: Parameters<Adapter["transaction"]>[0]) =>
+          adapterDb.transaction((transaction) =>
+            callback(createWrappedAdapter(transaction, true)),
+          ),
+      };
+      return wrappedAdapter as Adapter;
+    };
+
+    return createWrappedAdapter(db, false);
   };
+}
+
+function unavailableIdentityAccount(): APIError {
+  return new APIError("FORBIDDEN", {
+    code: "ACCOUNT_UNAVAILABLE",
+    message: "Identity account is unavailable",
+  });
 }
 
 function isDisabledIdentityUser(value: unknown): boolean {
@@ -282,7 +568,7 @@ function isDisabledIdentityUser(value: unknown): boolean {
     typeof value === "object" &&
     value !== null &&
     "status" in value &&
-    value.status === "disabled"
+    value.status !== "active"
   );
 }
 
@@ -335,6 +621,7 @@ async function verifyHostedWalletSignature(
     .where(
       and(
         eq(schema.walletPrincipal.accountKind, "eoa"),
+        eq(schema.walletPrincipal.family, "evm"),
         sql`lower(${schema.walletPrincipal.address}) = lower(${input.address})`,
       ),
     )
@@ -444,3 +731,4 @@ function firstNonEmptyString(...values: unknown[]): string | undefined {
 }
 
 export type IdentityAuth = ReturnType<typeof createIdentityAuth>["auth"];
+export type IdentityProofAuth = ReturnType<typeof createIdentityProofAuth>;
