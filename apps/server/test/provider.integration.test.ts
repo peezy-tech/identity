@@ -356,7 +356,7 @@ if (databaseUrl === undefined) {
       ).toHaveLength(1);
     });
 
-    test("consolidates a proof-authenticated subject transactionally and revokes both sessions", async () => {
+    test("consolidates a proof-authenticated subject transactionally and revokes sessions and provider tokens", async () => {
       const survivorWallet = privateKeyToAccount(
         "0x5555555555555555555555555555555555555555555555555555555555555555",
       );
@@ -372,8 +372,13 @@ if (databaseUrl === undefined) {
         .where(eq(user.id, source.userId));
       await database.db.insert(account).values({
         accountId: "github-source-merge",
+        accessToken: "source-access-token",
+        accessTokenExpiresAt: new Date("2026-08-08T00:00:00.000Z"),
         id: crypto.randomUUID(),
+        idToken: "source-id-token",
         providerId: "github",
+        refreshToken: "source-refresh-token",
+        refreshTokenExpiresAt: new Date("2026-09-08T00:00:00.000Z"),
         userId: source.userId,
       });
       const proof = await signInHostedWallet(
@@ -429,6 +434,23 @@ if (databaseUrl === undefined) {
         .from(user)
         .where(eq(user.id, source.userId));
       expect(sourceEmailRow?.email).toMatch(/\.invalid$/);
+      const [mergedAccount] = await database.db
+        .select({
+          accessToken: account.accessToken,
+          accessTokenExpiresAt: account.accessTokenExpiresAt,
+          idToken: account.idToken,
+          refreshToken: account.refreshToken,
+          refreshTokenExpiresAt: account.refreshTokenExpiresAt,
+        })
+        .from(account)
+        .where(eq(account.accountId, "github-source-merge"));
+      expect(mergedAccount).toEqual({
+        accessToken: null,
+        accessTokenExpiresAt: null,
+        idToken: null,
+        refreshToken: null,
+        refreshTokenExpiresAt: null,
+      });
       expect(
         await database.db
           .select()

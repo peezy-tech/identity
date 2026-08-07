@@ -268,6 +268,17 @@ export async function commitAccountMerge(input: {
 
     const userIds = [attempt.sourceUserId, attempt.targetUserId];
     await transaction
+      .update(account)
+      .set({
+        accessToken: null,
+        accessTokenExpiresAt: null,
+        idToken: null,
+        refreshToken: null,
+        refreshTokenExpiresAt: null,
+        updatedAt: new Date(),
+      })
+      .where(inArray(account.userId, userIds));
+    await transaction
       .delete(oauthAccessToken)
       .where(inArray(oauthAccessToken.userId, userIds));
     await transaction
