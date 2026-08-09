@@ -17,7 +17,7 @@ import { serveStatic } from "hono/bun";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
-import { ZodError } from "zod";
+import { z, ZodError } from "zod";
 
 import type { IdentityAuth, IdentityProofAuth } from "./auth";
 import {
@@ -34,7 +34,11 @@ import { verifySecret } from "./clients";
 import type { IdentityConfig } from "./config";
 import type { IdentityDb } from "./db/client";
 import { appClient, session } from "./db/schema";
-import { identityMe, IdentityNotFoundError } from "./identity";
+import {
+  identityMe,
+  IdentityNotFoundError,
+  updateIdentityProfile,
+} from "./identity";
 import {
   accountPage,
   consentPage,
@@ -68,6 +72,12 @@ type AppDependencies = {
 };
 
 type IdentityConfigSocialProvider = keyof IdentityConfig["socialProviders"];
+
+const IdentityProfileUpdateSchema = z
+  .object({
+    displayName: z.string().trim().min(1).max(128),
+  })
+  .strict();
 
 export function createIdentityApp(dependencies: AppDependencies): Hono {
   const app = new Hono();
@@ -119,7 +129,13 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     }),
   );
 
-  app.get("/", (context) => context.html(homePage()));
+  app.get("/", async (context) => {
+    const identitySession = await dependencies.auth.api.getSession({
+      headers: context.req.raw.headers,
+    });
+    return context.html(homePage({ signedIn: identitySession !== null }));
+  });
+  app.get("/favicon.ico", (context) => context.body(null, 204));
   app.get(
     "/assets/account-client.js",
     serveStatic({
@@ -149,10 +165,21 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
       accountSecurityHeaders(nonce),
     );
   });
-  app.get("/sign-in", (context) => {
+  app.get("/sign-in", async (context) => {
+    const requestedReturn = safeReturnPath(context.req.query("return_to"));
+    const callbackPath =
+      context.req.query("client_id") === undefined
+        ? requestedReturn
+        : `/api/auth/oauth2/authorize${new URL(context.req.url).search}`;
+    const identitySession = await dependencies.auth.api.getSession({
+      headers: context.req.raw.headers,
+    });
+    if (identitySession !== null) {
+      return context.redirect(callbackPath);
+    }
     const nonce = crypto.randomUUID().replaceAll("-", "");
     return context.html(
-      signInPage(dependencies.socialProviderNames, nonce),
+      signInPage(dependencies.socialProviderNames, nonce, callbackPath),
       200,
       contentSecurityHeaders(nonce),
     );
@@ -234,6 +261,26 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     }
     return context.json(
       await identityMe(dependencies.db, identitySession.user.id),
+    );
+  });
+
+  app.post("/v1/account/profile", async (context) => {
+    requireSameOrigin(context.req.raw, dependencies.config.baseUrl);
+    const identitySession = await requireIdentitySession(
+      dependencies.auth,
+      context.req.raw.headers,
+    );
+    const body = IdentityProfileUpdateSchema.parse(await boundedJson(context));
+    await requireRateLimit(dependencies.db, {
+      key: `profile-update:${identitySession.user.id}`,
+      limit: 30,
+      windowMs: 5 * 60_000,
+    });
+    return context.json(
+      await updateIdentityProfile(dependencies.db, {
+        displayName: body.displayName,
+        subject: identitySession.user.id,
+      }),
     );
   });
 
@@ -784,6 +831,24 @@ function contentSecurityHeaders(nonce: string): Record<string, string> {
       "style-src 'unsafe-inline'",
     ].join("; "),
   };
+}
+
+function safeReturnPath(value: string | undefined): string {
+  if (value === undefined || !value.startsWith("/") || value.startsWith("//")) {
+    return "/account";
+  }
+  try {
+    const target = new URL(value, "https://identity.invalid");
+    if (
+      target.origin !== "https://identity.invalid" ||
+      target.pathname.startsWith("//")
+    ) {
+      return "/account";
+    }
+    return `${target.pathname}${target.search}${target.hash}`;
+  } catch {
+    return "/account";
+  }
 }
 
 function accountSecurityHeaders(nonce: string): Record<string, string> {

@@ -61,6 +61,34 @@ Do not send traffic until readiness succeeds. Keep at least one previously
 working image reference available for rollback, but never roll the database
 back independently of the compatible service and secret state.
 
+## Social provider callback registration
+
+Every enabled social provider must register both production Identity callbacks
+directly: `/api/auth` completes ordinary sign-in and account linking, while
+`/api/proof-auth` proves a duplicate account before consolidation. OAuth
+providers compare these values literally; redirecting an older service domain
+to Identity is not a substitute and can also break the state cookie that
+completes the flow.
+
+- Discord: `https://identity.peezy.tech/api/auth/callback/discord` and
+  `https://identity.peezy.tech/api/proof-auth/callback/discord`
+- Telegram: `https://identity.peezy.tech/api/auth/callback/telegram` and
+  `https://identity.peezy.tech/api/proof-auth/callback/telegram`
+- X: `https://identity.peezy.tech/api/auth/callback/twitter` and
+  `https://identity.peezy.tech/api/proof-auth/callback/twitter`
+- GitHub, when enabled: `https://identity.peezy.tech/api/auth/callback/github`
+  and `https://identity.peezy.tech/api/proof-auth/callback/github`
+- Apple, when enabled: `https://identity.peezy.tech/api/auth/callback/apple`
+  and `https://identity.peezy.tech/api/proof-auth/callback/apple`
+
+Provider configuration is a release gate. For each enabled provider, complete
+a hosted sign-in and a duplicate-account proof, confirm the provider receives
+the matching exact callback above, and verify the browser returns to
+`/account`. The normal flow must show “Signed in to peezy.tech Identity”; the
+proof flow must show its consolidation preview. Test these separately from
+application OIDC callbacks such as PledgeCash and from the optional Privy Lobby
+migration domain allowlist.
+
 ## Legacy Lobby migration bridge
 
 Privy migration is off by default and ordinary startup does not require Privy

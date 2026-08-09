@@ -1,21 +1,25 @@
 import type { SocialProviderName } from "./config";
 import { HOSTED_WALLET_STATEMENT } from "./constants";
 
-export function homePage(): string {
+export function homePage(input: { signedIn: boolean }): string {
   return document(
     "peezy.tech identity",
     `
       <main>
-        <p class="eyebrow">peezy.tech</p>
-        <h1>One account across peezy.tech projects.</h1>
+        <p class="eyebrow">peezy.tech identity</p>
+        <h1>${input.signedIn ? "Your account is ready." : "One account across peezy.tech."}</h1>
         <p class="lede">
-          Sign in with a social account, an EVM wallet, or both. Wallets are
-          credentials you can add; they are not required to have an account.
+          ${
+            input.signedIn
+              ? "You are signed in. Open your account to review your profile, sign-in methods, and optional Lobby migration."
+              : "Create or open your peezy.tech account with Discord, Telegram, X, or a wallet. Privy is only used later to migrate an old Lobby profile."
+          }
         </p>
         <div class="actions">
-          <a class="primary" href="/sign-in">Sign in</a>
+          <a class="primary" href="${input.signedIn ? "/account" : "/sign-in?return_to=%2Faccount"}">${input.signedIn ? "Open account" : "Sign in to peezy.tech"}</a>
           <a href="/api/auth/.well-known/openid-configuration">OpenID configuration</a>
         </div>
+        <p class="fine-print">${input.signedIn ? "Signed in to peezy.tech Identity" : "Social accounts and wallets are sign-in methods for the same peezy.tech account."}</p>
       </main>
     `,
   );
@@ -51,6 +55,10 @@ export function accountPage(
       .account-nav { display: flex; justify-content: space-between; align-items: center;
         padding-bottom: 1.5rem; border-bottom: 1px solid #272b28; }
       .account-brand { color: #f5f4ef; font-weight: 760; letter-spacing: -.03em; text-decoration: none; }
+      .session-state { display: inline-flex; align-items: center; gap: .5rem; color: #aeb2ac;
+        font-size: .78rem; letter-spacing: .04em; }
+      .session-state i { width: .48rem; height: .48rem; border-radius: 50%; background: #b9f27c;
+        box-shadow: 0 0 0 .25rem rgba(185,242,124,.1); }
       .account-kicker { color: #b9f27c; font: 700 .72rem/1 ui-monospace, monospace;
         letter-spacing: .14em; text-transform: uppercase; }
       .account-heading { max-width: 45rem; margin: 4.5rem 0 4rem; }
@@ -75,12 +83,12 @@ export function accountPage(
     <div class="account-shell">
       <nav class="account-nav" aria-label="Account navigation">
         <a class="account-brand" href="/">peezy.tech</a>
-        <span class="account-kicker">Identity</span>
+        <span class="session-state"><i aria-hidden="true"></i> Signed in</span>
       </nav>
       <header class="account-heading">
         <span class="account-kicker">Account center</span>
-        <h1>Your ways in.</h1>
-        <p>Review your credentials, bring over a Lobby account, or consolidate duplicate peezy.tech identities.</p>
+        <h1>Your peezy.tech account.</h1>
+        <p>Update your profile, manage how you sign in, bring over an old Lobby profile, or consolidate duplicate identities.</p>
       </header>
       <div id="account-root"><p class="account-loading">Loading your identity…</p></div>
     </div>
@@ -93,14 +101,19 @@ export function accountPage(
 export function signInPage(
   providers: SocialProviderName[],
   nonce: string,
+  callbackPath = "/account",
 ): string {
   const socialButtons = providers
     .map(
       (provider) =>
-        `<button type="button" data-provider="${provider}">Continue with ${providerLabel(provider)}</button>`,
+        `<button type="button" data-provider="${provider}"><span>Sign in with ${providerLabel(provider)}</span><small>peezy.tech Identity</small></button>`,
     )
     .join("");
   const providersJson = JSON.stringify(providers).replaceAll("<", "\\u003c");
+  const callbackPathJson = JSON.stringify(callbackPath).replaceAll(
+    "<",
+    "\\u003c",
+  );
   const walletStatementJson = JSON.stringify(HOSTED_WALLET_STATEMENT);
 
   return document(
@@ -108,28 +121,35 @@ export function signInPage(
     `
       <main>
         <p class="eyebrow">peezy.tech identity</p>
-        <h1>Sign in</h1>
-        <p class="lede">Use one identity across every peezy.tech project.</p>
+        <h1>Open your account.</h1>
+        <p class="lede">Choose any method already attached to your peezy.tech account, or use one to create it.</p>
+        <div class="identity-note">
+          <strong>These are peezy.tech sign-ins.</strong>
+          <span>Privy is not used here. It appears inside your account only when you choose to import an old Lobby profile.</span>
+        </div>
+        ${providers.length > 0 ? '<p class="method-label">Social sign-in</p>' : ""}
         <div class="stack" id="social-providers">${socialButtons}</div>
-        ${providers.length > 0 ? '<p class="divider"><span>or</span></p>' : ""}
-        <button class="wallet" id="wallet" type="button">Continue with an EVM wallet</button>
-        <button class="wallet" id="solana-wallet" type="button">Continue with a Solana wallet</button>
+        ${providers.length > 0 ? '<p class="divider"><span>or use a wallet</span></p>' : ""}
+        <div class="stack wallet-stack">
+          <button class="wallet" id="wallet" type="button"><span>Sign in with an EVM wallet</span><small>MetaMask or another injected wallet</small></button>
+          <button class="wallet" id="solana-wallet" type="button"><span>Sign in with a Solana wallet</span><small>Phantom or another injected wallet</small></button>
+        </div>
         <p class="status" id="status" role="status" aria-live="polite"></p>
         <p class="fine-print">
-          A wallet is optional. Connecting one proves ownership and links it as
-          a credential on your peezy.tech account.
+          After successful sign-in, you will land on your account page. A wallet signature proves ownership; it never gives peezy.tech control of your funds.
         </p>
+        <a class="back-link" href="/">Back to Identity</a>
       </main>
       <script nonce="${nonce}">
         const providers = ${providersJson};
         const status = document.querySelector("#status");
-        const oauthQuery = new URLSearchParams(location.search);
-        const requestedReturn = oauthQuery.get("return_to");
-        const safeReturn = requestedReturn && requestedReturn.startsWith("/") &&
-          !requestedReturn.startsWith("//") ? requestedReturn : "/";
-        const callbackURL = oauthQuery.has("client_id")
-          ? location.origin + "/api/auth/oauth2/authorize" + location.search
-          : location.origin + safeReturn;
+        const callbackURL = location.origin + ${callbackPathJson};
+        const methodButtons = [...document.querySelectorAll("button")];
+
+        function setBusy(busy) {
+          for (const button of methodButtons) button.disabled = busy;
+          document.querySelector("main").setAttribute("aria-busy", String(busy));
+        }
 
         async function jsonRequest(path, body) {
           const response = await fetch(path, {
@@ -146,6 +166,7 @@ export function signInPage(
         }
 
         async function socialSignIn(provider) {
+          setBusy(true);
           status.textContent = "Opening " + provider + "…";
           const result = await jsonRequest("/api/auth/sign-in/social", {
             callbackURL,
@@ -157,12 +178,16 @@ export function signInPage(
 
         for (const button of document.querySelectorAll("[data-provider]")) {
           button.addEventListener("click", () => {
-            socialSignIn(button.dataset.provider).catch(showError);
+            socialSignIn(button.dataset.provider).catch((error) => {
+              setBusy(false);
+              showError(error);
+            });
           });
         }
 
         document.querySelector("#wallet").addEventListener("click", async () => {
           try {
+            setBusy(true);
             if (!window.ethereum) {
               throw new Error("No EVM wallet was detected in this browser");
             }
@@ -195,14 +220,17 @@ export function signInPage(
               signature,
               walletAddress: address,
             });
+            status.textContent = "Signed in. Opening your account…";
             location.assign(callbackURL);
           } catch (error) {
+            setBusy(false);
             showError(error);
           }
         });
 
         document.querySelector("#solana-wallet").addEventListener("click", async () => {
           try {
+            setBusy(true);
             if (!window.solana) {
               throw new Error("No Solana wallet was detected in this browser");
             }
@@ -229,8 +257,10 @@ export function signInPage(
               message: challenge.message,
               signature: btoa(binarySignature),
             });
+            status.textContent = "Signed in. Opening your account…";
             location.assign(callbackURL);
           } catch (error) {
+            setBusy(false);
             showError(error);
           }
         });
@@ -242,7 +272,10 @@ export function signInPage(
 
         const hintedProvider = new URLSearchParams(location.search).get("login_hint");
         if (hintedProvider && providers.includes(hintedProvider)) {
-          socialSignIn(hintedProvider).catch(showError);
+          socialSignIn(hintedProvider).catch((error) => {
+            setBusy(false);
+            showError(error);
+          });
         }
       </script>
     `,
@@ -327,20 +360,12 @@ export function linkSocialPage(
         document.querySelector("#continue").addEventListener("click", async () => {
           try {
             status.textContent = "Opening " + provider + "…";
-            const telegram = provider === "telegram";
-            const response = await fetch(
-              telegram ? "/api/auth/oauth2/link" : "/api/auth/link-social",
-              {
-                method: "POST",
-                credentials: "same-origin",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(
-                  telegram
-                    ? { callbackURL, providerId: "telegram" }
-                    : { callbackURL, provider }
-                ),
-              }
-            );
+            const response = await fetch("/api/auth/link-social", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ callbackURL, provider }),
+            });
             const result = await response.json().catch(() => ({}));
             if (!response.ok || !result.url) {
               throw new Error(result.message || result.error?.message || "Linking failed");
@@ -387,20 +412,39 @@ function document(title: string, body: string, nonce?: string): string {
         line-height: .94; letter-spacing: -.06em; }
       .lede { max-width: 32rem; color: #bbbdb7; font-size: 1.05rem; line-height: 1.6; }
       .stack { display: grid; gap: .7rem; margin-top: 2rem; }
+      .wallet-stack { margin-top: 0; }
       .actions { display: flex; flex-wrap: wrap; gap: .7rem; margin-top: 2rem; }
       button, a {
         border: 1px solid #343934; border-radius: 999px; padding: .85rem 1.2rem;
         color: inherit; background: #171a18; font: 650 .95rem/1 inherit;
         text-decoration: none; cursor: pointer; transition: border-color .15s, transform .15s;
       }
+      button { min-height: 3.25rem; display: flex; align-items: center; justify-content: space-between;
+        gap: 1rem; text-align: left; }
+      button small { color: #858b85; font-size: .72rem; font-weight: 560; }
       button:hover, a:hover { border-color: #b9f27c; transform: translateY(-1px); }
+      button:focus-visible, a:focus-visible { outline: 2px solid #b9f27c; outline-offset: 3px; }
+      button:disabled { cursor: wait; opacity: .55; transform: none; }
       .primary { color: #10120f; border-color: #b9f27c; background: #b9f27c; }
       .wallet { width: 100%; }
+      .identity-note { display: grid; gap: .35rem; margin: 1.5rem 0 0; padding: 1rem 0;
+        border-top: 1px solid #292d29; border-bottom: 1px solid #292d29; }
+      .identity-note strong { color: #f7f4ed; font-size: .9rem; }
+      .identity-note span { color: #858b85; font-size: .82rem; line-height: 1.5; }
+      .method-label { margin: 1.5rem 0 -1.2rem; color: #969b95; font-size: .75rem;
+        font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
       .divider { display: flex; align-items: center; gap: 1rem; color: #777c76;
         margin: 1.1rem 0; font-size: .8rem; }
       .divider::before, .divider::after { content: ""; height: 1px; background: #292d29; flex: 1; }
       .status { min-height: 1.5rem; color: #e5c36b; }
       .fine-print { color: #777c76; font-size: .8rem; line-height: 1.5; }
+      .back-link { display: inline-block; margin-top: .5rem; padding: 0; border: 0;
+        color: #aeb2ac; background: transparent; font-size: .82rem; }
+      .back-link:hover { color: #b9f27c; transform: none; }
+      @media (max-width: 520px) {
+        main { width: min(100% - 1.25rem, 35rem); padding: 2rem 0; }
+        button { align-items: flex-start; flex-direction: column; gap: .35rem; border-radius: 1rem; }
+      }
     </style>
   </head>
   <body>${body}</body>
