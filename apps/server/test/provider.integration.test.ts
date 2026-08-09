@@ -124,6 +124,8 @@ if (databaseUrl === undefined) {
 
     let database: IdentityDbClient;
     let app: ReturnType<typeof createIdentityApp>;
+    let identityAuth: ReturnType<typeof createIdentityAuth>["auth"];
+    let identityProofAuth: ReturnType<typeof createIdentityProofAuth>;
     const privyGateway: PrivyGateway = {
       async authenticateAccessToken(accessToken) {
         if (
@@ -206,12 +208,14 @@ if (databaseUrl === undefined) {
         config,
         database.db,
       );
+      identityAuth = auth;
+      identityProofAuth = createIdentityProofAuth(config, database.db);
       app = createIdentityApp({
         auth,
         config,
         db: database.db,
         privyGateway,
-        proofAuth: createIdentityProofAuth(config, database.db),
+        proofAuth: identityProofAuth,
         socialProviderNames,
       });
     });
@@ -251,6 +255,161 @@ if (databaseUrl === undefined) {
       expect(
         identity.credentials.some((credential) => credential.kind === "wallet"),
       ).toBe(false);
+    });
+
+    test("lands hosted sign-ins on a session-aware account route", async () => {
+      const signedOutHome = await app.request("https://identity.test/");
+      expect(signedOutHome.status).toBe(200);
+      expect(await signedOutHome.text()).toContain("Sign in to peezy.tech");
+
+      const signedOutPage = await app.request("https://identity.test/sign-in");
+      expect(signedOutPage.status).toBe(200);
+      const signedOutHtml = await signedOutPage.text();
+      expect(signedOutHtml).toContain("These are peezy.tech sign-ins.");
+      expect(signedOutHtml).toContain("Privy is not used here.");
+      expect(signedOutHtml).toContain(
+        'const callbackURL = location.origin + "/account"',
+      );
+
+      const routingWallet = privateKeyToAccount(
+        `0x${randomBytes(32).toString("hex")}`,
+      );
+      const signedIn = await signInHostedWallet(app, config, routingWallet);
+      const signedInHome = await app.request("https://identity.test/", {
+        headers: { Cookie: signedIn.cookie },
+      });
+      expect(signedInHome.status).toBe(200);
+      expect(await signedInHome.text()).toContain("Open account");
+
+      const accountRedirect = await app.request(
+        "https://identity.test/sign-in",
+        { headers: { Cookie: signedIn.cookie } },
+      );
+      expect(accountRedirect.status).toBe(302);
+      expect(accountRedirect.headers.get("location")).toBe("/account");
+
+      const safeReturn = await app.request(
+        "https://identity.test/sign-in?return_to=%2Faccount%3Ftab%3Dmethods",
+        { headers: { Cookie: signedIn.cookie } },
+      );
+      expect(safeReturn.status).toBe(302);
+      expect(safeReturn.headers.get("location")).toBe("/account?tab=methods");
+
+      for (const returnTo of [
+        "https%3A%2F%2Fevil.test%2Faccount",
+        "%2F%2Fevil.test%2Faccount",
+        "%2F..%2F%2Fevil.test%2Faccount",
+        "%2Fx%2F..%2F%2Fevil.test%2Faccount",
+        "%2F%252e%252e%2F%2Fevil.test%2Faccount",
+      ]) {
+        const rejectedReturn = await app.request(
+          `https://identity.test/sign-in?return_to=${returnTo}`,
+          { headers: { Cookie: signedIn.cookie } },
+        );
+        expect(rejectedReturn.status).toBe(302);
+        expect(rejectedReturn.headers.get("location")).toBe("/account");
+      }
+
+      const oidcRedirect = await app.request(
+        "https://identity.test/sign-in?client_id=pledge-cash&response_type=code&redirect_uri=https%3A%2F%2Fpledge.test%2Fauth%2Fcallback%2Fpeezy",
+        { headers: { Cookie: signedIn.cookie } },
+      );
+      expect(oidcRedirect.status).toBe(302);
+      expect(oidcRedirect.headers.get("location")).toBe(
+        "/api/auth/oauth2/authorize?client_id=pledge-cash&response_type=code&redirect_uri=https%3A%2F%2Fpledge.test%2Fauth%2Fcallback%2Fpeezy",
+      );
+    });
+
+    test("updates the account profile with same-origin session protection and signs out", async () => {
+      const profileWallet = privateKeyToAccount(
+        `0x${randomBytes(32).toString("hex")}`,
+      );
+      const signedIn = await signInHostedWallet(app, config, profileWallet);
+      const update = (
+        body: unknown,
+        cookie = signedIn.cookie,
+        origin = config.baseUrl,
+      ) =>
+        app.request("https://identity.test/v1/account/profile", {
+          body: JSON.stringify(body),
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: cookie,
+            Origin: origin,
+          },
+          method: "POST",
+        });
+
+      const response = await update({ displayName: "Peezy Operator" });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        user: { displayName: "Peezy Operator", id: signedIn.userId },
+      });
+
+      const me = await app.request("https://identity.test/v1/me", {
+        headers: { Cookie: signedIn.cookie },
+      });
+      expect(me.status).toBe(200);
+      expect(await me.json()).toMatchObject({
+        user: { displayName: "Peezy Operator", id: signedIn.userId },
+      });
+
+      expect((await update({ displayName: "" })).status).toBe(400);
+      expect(
+        (await update({ displayName: "Nope", unexpected: true })).status,
+      ).toBe(400);
+      expect(
+        (
+          await update(
+            { displayName: "Cross origin" },
+            signedIn.cookie,
+            "https://evil.test",
+          )
+        ).status,
+      ).toBe(403);
+      expect((await update({ displayName: "No session" }, "")).status).toBe(
+        401,
+      );
+
+      const signOutResponse = await app.request(
+        "https://identity.test/api/auth/sign-out",
+        {
+          body: "{}",
+          headers: {
+            "Content-Type": "application/json",
+            Cookie: signedIn.cookie,
+            Origin: config.baseUrl,
+          },
+          method: "POST",
+        },
+      );
+      expect(signOutResponse.status).toBe(200);
+      const afterSignOut = await app.request("https://identity.test/account", {
+        headers: { Cookie: signedIn.cookie },
+      });
+      expect(afterSignOut.status).toBe(302);
+      expect(afterSignOut.headers.get("location")).toBe(
+        "/sign-in?return_to=%2Faccount",
+      );
+    });
+
+    test("uses the core social-link endpoint for Telegram", async () => {
+      const telegramApp = createIdentityApp({
+        auth: identityAuth,
+        config,
+        db: database.db,
+        privyGateway,
+        proofAuth: identityProofAuth,
+        socialProviderNames: ["telegram"],
+      });
+      const response = await telegramApp.request(
+        "https://identity.test/link-social?provider=telegram&callback_url=https%3A%2F%2Fidentity.test%2Faccount",
+      );
+      expect(response.status).toBe(200);
+      const html = await response.text();
+      expect(html).toContain('fetch("/api/auth/link-social"');
+      expect(html).toContain("JSON.stringify({ callbackURL, provider })");
+      expect(html).not.toContain("/api/auth/oauth2/link");
     });
 
     test("keeps primary and proof SIWE nonces in separate namespaces", async () => {

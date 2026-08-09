@@ -11,6 +11,7 @@ import {
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 
+import { isSignInCredential } from "./account-client-credentials";
 import { selectEthereumAccount } from "./account-client-wallet";
 
 type Provider = "apple" | "discord" | "github" | "telegram" | "twitter";
@@ -20,11 +21,19 @@ type Credential = {
   family?: "evm" | "solana";
   kind: "email" | "social" | "wallet" | "passkey";
   provider?: Provider;
+  signInEnabled?: boolean;
   value?: string;
+  verified?: boolean;
 };
 type Identity = {
   credentials: Credential[];
-  user: { displayName?: string; id: string; primaryEmail?: { value: string } };
+  user: {
+    avatarUrl?: string;
+    createdAt: string;
+    displayName?: string;
+    id: string;
+    primaryEmail?: { value: string; verified: boolean };
+  };
 };
 type MigrationIdentity = {
   chainType?: string;
@@ -85,6 +94,20 @@ const ethereum = () =>
 
 const config = window.__PEEZY_ACCOUNT_CONFIG__;
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Identity request failed";
+}
+
+function providerLabel(provider: Provider): string {
+  return {
+    apple: "Apple",
+    discord: "Discord",
+    github: "GitHub",
+    telegram: "Telegram",
+    twitter: "X",
+  }[provider];
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     credentials: "same-origin",
@@ -106,22 +129,47 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 
 function AccountApp() {
   const [identity, setIdentity] = useState<Identity | null>(null);
+  const [identityError, setIdentityError] = useState<string | null>(null);
   const [claims, setClaims] = useState<Claim[]>([]);
+  const [claimsError, setClaimsError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string>("");
   const [mergePreview, setMergePreview] = useState<MergePreview | null>(null);
+  const [profileName, setProfileName] = useState("");
+
+  async function refreshIdentity() {
+    try {
+      const nextIdentity = await requestJson<Identity>("/v1/me");
+      setIdentity(nextIdentity);
+      setIdentityError(null);
+      setProfileName(nextIdentity.user.displayName ?? "");
+    } catch (error) {
+      setIdentityError(errorMessage(error));
+      throw error;
+    }
+  }
+
+  async function refreshClaims() {
+    if (!config.privyAppId) return;
+    try {
+      const nextClaims = await requestJson<{ claims: Claim[] }>(
+        "/v1/migrations/privy/claims/current",
+      );
+      setClaims(nextClaims.claims);
+      setClaimsError(null);
+    } catch (error) {
+      setClaimsError(errorMessage(error));
+    }
+  }
 
   async function refresh() {
-    const [nextIdentity, nextClaims] = await Promise.all([
-      requestJson<Identity>("/v1/me"),
-      requestJson<{ claims: Claim[] }>("/v1/migrations/privy/claims/current"),
-    ]);
-    setIdentity(nextIdentity);
-    setClaims(nextClaims.claims);
+    await refreshIdentity();
+    await refreshClaims();
   }
 
   useEffect(() => {
-    refresh().catch(showError);
+    refreshIdentity().catch(() => undefined);
+    refreshClaims().catch(() => undefined);
     if (new URLSearchParams(location.search).get("merge") === "proof") {
       setBusy("merge-proof");
       requestJson<MergePreview>("/v1/account-merges/proofs", {
@@ -150,8 +198,47 @@ function AccountApp() {
   }, []);
 
   function showError(error: unknown) {
-    setNotice(
-      error instanceof Error ? error.message : "Identity request failed",
+    setNotice(errorMessage(error));
+  }
+
+  async function saveProfile(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy("profile");
+    setNotice("");
+    try {
+      const nextIdentity = await requestJson<Identity>("/v1/account/profile", {
+        method: "POST",
+        body: JSON.stringify({ displayName: profileName }),
+      });
+      setIdentity(nextIdentity);
+      setProfileName(nextIdentity.user.displayName ?? "");
+      setNotice("Profile saved.");
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function signOut() {
+    setBusy("sign-out");
+    setNotice("");
+    try {
+      await requestJson("/api/auth/sign-out", {
+        method: "POST",
+        body: "{}",
+      });
+      location.replace("/sign-in?return_to=%2Faccount");
+    } catch (error) {
+      showError(error);
+      setBusy(null);
+    }
+  }
+
+  function linkSocial(provider: Provider) {
+    const callback = `${location.origin}/account`;
+    location.assign(
+      `/link-social?provider=${provider}&callback_url=${encodeURIComponent(callback)}`,
     );
   }
 
@@ -328,71 +415,237 @@ function AccountApp() {
     }
   }
 
-  if (!identity)
-    return <p className="account-loading">Loading your identity…</p>;
+  if (!identity) {
+    if (identityError) {
+      return (
+        <>
+          <style>{styles}</style>
+          <section className="account-error" aria-live="polite">
+            <strong>We could not load your peezy.tech account.</strong>
+            <p>{identityError}</p>
+            <div className="button-row">
+              <button
+                className="quiet"
+                onClick={() => refreshIdentity().catch(() => undefined)}
+              >
+                Try again
+              </button>
+              <a
+                className="quiet link-button"
+                href="/sign-in?return_to=%2Faccount"
+              >
+                Sign in again
+              </a>
+            </div>
+          </section>
+        </>
+      );
+    }
+    return (
+      <>
+        <style>{styles}</style>
+        <p className="account-loading">Loading your peezy.tech account…</p>
+      </>
+    );
+  }
+  const linkedProviders = new Set(
+    identity.credentials.flatMap((credential) =>
+      credential.kind === "social" && credential.provider
+        ? [credential.provider]
+        : [],
+    ),
+  );
+  const signInCredentials = identity.credentials.filter(isSignInCredential);
   return (
     <>
       <style>{styles}</style>
+      {notice ? (
+        <p className="notice" role="status" aria-live="polite">
+          {notice}
+        </p>
+      ) : null}
       <section className="ledger" aria-labelledby="current-account">
         <div className="section-intro">
           <span>01</span>
           <div>
-            <h2 id="current-account">Current account</h2>
-            <p>This subject survives every migration and consolidation.</p>
+            <h2 id="current-account">Profile</h2>
+            <p>This is the information attached to your peezy.tech account.</p>
           </div>
         </div>
-        <div className="subject-line">
-          <strong>
-            {identity.user.displayName ??
-              identity.user.primaryEmail?.value ??
-              "peezy.tech account"}
-          </strong>
-          <code>{identity.user.id}</code>
+        <div className="account-summary">
+          <div className="avatar" aria-hidden="true">
+            {identity.user.avatarUrl ? (
+              <img alt="" src={identity.user.avatarUrl} />
+            ) : (
+              (identity.user.displayName ?? "P").slice(0, 1).toUpperCase()
+            )}
+          </div>
+          <div>
+            <strong>
+              {identity.user.displayName ??
+                identity.user.primaryEmail?.value ??
+                "peezy.tech account"}
+            </strong>
+            <span>Signed in to peezy.tech Identity</span>
+          </div>
+        </div>
+        <form className="profile-form" onSubmit={saveProfile}>
+          <label htmlFor="display-name">Display name</label>
+          <div className="field-row">
+            <input
+              id="display-name"
+              maxLength={128}
+              onChange={(event) => setProfileName(event.target.value)}
+              required
+              value={profileName}
+            />
+            <button
+              className="save"
+              disabled={busy !== null || profileName.trim().length === 0}
+              type="submit"
+            >
+              {busy === "profile" ? "Saving…" : "Save profile"}
+            </button>
+          </div>
+          <div className="profile-metadata">
+            <div>
+              <span>Email</span>
+              <strong>
+                {identity.user.primaryEmail?.value ?? "No email attached"}
+              </strong>
+              <small>
+                {identity.user.primaryEmail
+                  ? identity.user.primaryEmail.verified
+                    ? "Verified · read only"
+                    : "Unverified · read only"
+                  : "Wallet-only account"}
+              </small>
+            </div>
+            <div>
+              <span>Account ID</span>
+              <code>{identity.user.id}</code>
+              <small>Stable across linked sign-in methods</small>
+            </div>
+          </div>
+          <button
+            className="sign-out"
+            disabled={busy !== null}
+            onClick={signOut}
+            type="button"
+          >
+            Sign out of peezy.tech
+          </button>
+        </form>
+      </section>
+
+      <section className="ledger" aria-labelledby="sign-in-methods">
+        <div className="section-intro">
+          <span>02</span>
+          <div>
+            <h2 id="sign-in-methods">Sign-in methods</h2>
+            <p>Every method below opens this same peezy.tech account.</p>
+          </div>
         </div>
         <div className="credential-list">
-          {identity.credentials.map((credential, index) => (
-            <div className="credential" key={`${credential.kind}-${index}`}>
-              <span>
-                {credential.kind === "wallet" && credential.family
-                  ? `${credential.family} wallet`
-                  : credential.kind}
-              </span>
-              <strong>
-                {credential.provider ??
-                  credential.address ??
-                  credential.value ??
-                  "credential"}
-              </strong>
-            </div>
-          ))}
+          {signInCredentials.length > 0 ? (
+            signInCredentials.map((credential, index) => (
+              <div className="credential" key={`${credential.kind}-${index}`}>
+                <span>
+                  {credential.kind === "wallet" && credential.family
+                    ? `${credential.family} wallet`
+                    : credential.kind === "social" && credential.provider
+                      ? providerLabel(credential.provider)
+                      : credential.kind}
+                </span>
+                <strong>
+                  {credential.address ??
+                    credential.value ??
+                    (credential.provider
+                      ? `${providerLabel(credential.provider)} account`
+                      : "credential")}
+                </strong>
+                <small>
+                  {credential.kind === "wallet" &&
+                  credential.signInEnabled === false
+                    ? "Linked · sign-in disabled"
+                    : "Can sign in"}
+                </small>
+              </div>
+            ))
+          ) : (
+            <p className="credential-empty">No sign-in methods are linked.</p>
+          )}
+        </div>
+        <div className="add-methods">
+          <strong>Add another sign-in method</strong>
+          <p className="muted">
+            Linking another method gives you another way back into this account.
+          </p>
+          <div className="button-row">
+            {config.providers.map((provider) => (
+              <button
+                className="quiet"
+                disabled={busy !== null || linkedProviders.has(provider)}
+                key={provider}
+                onClick={() => linkSocial(provider)}
+              >
+                {linkedProviders.has(provider)
+                  ? `${providerLabel(provider)} linked`
+                  : `Link ${providerLabel(provider)}`}
+              </button>
+            ))}
+            <button
+              className="quiet"
+              disabled={busy !== null}
+              onClick={() => {
+                setBusy("link-wallet");
+                linkWallet()
+                  .catch(showError)
+                  .finally(() => setBusy(null));
+              }}
+            >
+              Link EVM wallet
+            </button>
+            <button
+              className="quiet"
+              disabled={busy !== null}
+              onClick={() => {
+                setBusy("link-solana-wallet");
+                linkSolanaWallet()
+                  .catch(showError)
+                  .finally(() => setBusy(null));
+              }}
+            >
+              Link Solana wallet
+            </button>
+          </div>
         </div>
       </section>
 
       <section className="ledger" aria-labelledby="legacy-account">
         <div className="section-intro">
-          <span>02</span>
+          <span>03</span>
           <div>
-            <h2 id="legacy-account">Lobby history</h2>
+            <h2 id="legacy-account">Import an old Lobby profile</h2>
             <p>
-              A Privy login claims the complete legacy user and every identity
-              attached to it.
+              This optional step uses Privy only to find and import identities
+              from the retired Lobby account system. Privy is not your
+              peezy.tech sign-in.
             </p>
           </div>
         </div>
-        {config.privyAppId ? (
-          <PrivyMigration
-            claims={claims}
-            busy={busy}
-            setBusy={setBusy}
-            refresh={refresh}
-            showError={showError}
-            reverify={reverify}
-            linkWallet={linkWallet}
-            linkSolanaWallet={linkSolanaWallet}
-          />
-        ) : (
-          <p className="muted">Migration is currently unavailable.</p>
-        )}
+        <PrivyMigrationPanel
+          busy={busy}
+          claims={claims}
+          claimsError={claimsError}
+          linkSolanaWallet={linkSolanaWallet}
+          linkWallet={linkWallet}
+          refresh={refresh}
+          refreshClaims={refreshClaims}
+          reverify={reverify}
+          setBusy={setBusy}
+          showError={showError}
+        />
       </section>
 
       <section
@@ -400,12 +653,12 @@ function AccountApp() {
         aria-labelledby="consolidate-account"
       >
         <div className="section-intro">
-          <span>03</span>
+          <span>04</span>
           <div>
             <h2 id="consolidate-account">Consolidate accounts</h2>
             <p>
-              Prove a second account, move its credentials here, and permanently
-              retire its subject.
+              Advanced: prove a duplicate account, move its sign-in methods
+              here, and permanently retire the duplicate.
             </p>
           </div>
         </div>
@@ -436,7 +689,8 @@ function AccountApp() {
         ) : (
           <div>
             <p className="muted">
-              Choose how to prove the account you want to retire.
+              Choose a method attached to the duplicate account you want to
+              retire.
             </p>
             <div className="button-row">
               {config.providers.map((provider) => (
@@ -446,7 +700,7 @@ function AccountApp() {
                   key={provider}
                   onClick={() => proveSocial(provider)}
                 >
-                  {provider}
+                  Prove with {providerLabel(provider)}
                 </button>
               ))}
               <button
@@ -459,7 +713,7 @@ function AccountApp() {
                     .finally(() => setBusy(null));
                 }}
               >
-                EVM wallet
+                Prove with EVM wallet
               </button>
               <button
                 className="quiet"
@@ -471,16 +725,91 @@ function AccountApp() {
                     .finally(() => setBusy(null));
                 }}
               >
-                Solana wallet
+                Prove with Solana wallet
               </button>
             </div>
           </div>
         )}
       </section>
-      <p className="notice" role="status" aria-live="polite">
-        {notice}
-      </p>
     </>
+  );
+}
+
+class MigrationBoundary extends React.Component<
+  { children: React.ReactNode },
+  { failed: boolean }
+> {
+  override state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  override render() {
+    if (this.state.failed) {
+      return (
+        <div className="migration-unavailable" role="status">
+          <strong>Lobby import is temporarily unavailable.</strong>
+          <p>Your peezy.tech account and sign-in methods are unaffected.</p>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function PrivyMigrationPanel(props: {
+  busy: string | null;
+  claims: Claim[];
+  claimsError: string | null;
+  refresh(): Promise<void>;
+  refreshClaims(): Promise<void>;
+  reverify(item: MigrationIdentity): void;
+  linkWallet(addressHint?: string, provider?: EthereumProvider): Promise<void>;
+  linkSolanaWallet(addressHint?: string, wallet?: SolanaSigner): Promise<void>;
+  setBusy(value: string | null): void;
+  showError(error: unknown): void;
+}) {
+  if (!config.privyAppId) {
+    return <p className="muted">Lobby import is currently unavailable.</p>;
+  }
+  return (
+    <MigrationBoundary>
+      <PrivyProvider
+        appId={config.privyAppId}
+        config={{
+          appearance: {
+            theme: "dark",
+            accentColor: "#B9F27C",
+            walletChainType: "ethereum-and-solana",
+          },
+          externalWallets: { solana: { connectors: solanaConnectors } },
+        }}
+      >
+        <PrivyMigration
+          busy={props.busy}
+          claims={props.claims}
+          linkSolanaWallet={props.linkSolanaWallet}
+          linkWallet={props.linkWallet}
+          refresh={props.refresh}
+          reverify={props.reverify}
+          setBusy={props.setBusy}
+          showError={props.showError}
+        />
+        {props.claimsError ? (
+          <div className="migration-unavailable" role="status">
+            <strong>Imported Lobby history could not be loaded.</strong>
+            <p>{props.claimsError}</p>
+            <button
+              className="quiet"
+              onClick={() => props.refreshClaims().catch(props.showError)}
+            >
+              Retry Lobby history
+            </button>
+          </div>
+        ) : null}
+      </PrivyProvider>
+    </MigrationBoundary>
   );
 }
 
@@ -603,7 +932,7 @@ function PrivyMigration(props: {
         disabled={!ready || props.busy !== null}
         onClick={start}
       >
-        Migrate from Privy <span>↗</span>
+        Continue with Privy to import <span>↗</span>
       </button>
       {props.claims.map((claim) => (
         <div className="claim" key={claim.id}>
@@ -648,7 +977,67 @@ function PrivyMigration(props: {
 }
 
 const styles = `
-  .ledger{border-top:1px solid #2b2f2c;padding:2.2rem 0 3.4rem}.section-intro{display:grid;grid-template-columns:3rem 1fr;gap:1rem;align-items:start}.section-intro>span{color:#b9f27c;font:700 .72rem/1 ui-monospace,monospace}.section-intro h2{font-size:clamp(1.55rem,3vw,2.35rem);letter-spacing:-.045em;margin:-.25rem 0 .4rem}.section-intro p,.muted{color:#969c96;line-height:1.55;margin:0}.subject-line{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;margin:2rem 0 1rem}.subject-line strong{font-size:1.2rem}.subject-line strong,.credential strong{overflow-wrap:anywhere}.subject-line code{color:#747a74;font-size:.72rem}.credential-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(13rem,1fr));border-bottom:1px solid #272b28}.credential{display:flex;flex-direction:column;gap:.35rem;padding:1rem 0;border-top:1px solid #272b28}.credential span,.migration-row span{color:#858b85;font-size:.72rem;text-transform:uppercase;letter-spacing:.09em}.primary-action{width:100%;display:flex;justify-content:space-between;align-items:center;margin-top:2rem;padding:1.2rem 1.3rem;border:0;border-radius:.25rem;background:#b9f27c;color:#11150f;font-weight:790;cursor:pointer}.primary-action:hover{background:#c8ff8b}.primary-action:disabled,button:disabled{opacity:.48;cursor:not-allowed}.claim{margin-top:2rem}.claim-head,.migration-row{display:flex;justify-content:space-between;align-items:center;gap:1rem;border-top:1px solid #272b28;padding:1rem 0}.claim-head time{color:#747a74;font-size:.8rem}.migration-row>div:first-child{display:flex;flex-direction:column;gap:.25rem}.disposition{display:flex;align-items:center;gap:1rem;text-align:right}.disposition>[data-state]{color:#aab0aa}.disposition>[data-state=linked],.disposition>[data-state=already_linked]{color:#b9f27c}.disposition>[data-state=conflict]{color:#ff9a84}.button-row{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1.4rem}.quiet,.danger,.text-button{border:1px solid #393e3a;background:transparent;color:#f5f4ef;border-radius:.25rem;padding:.72rem 1rem;cursor:pointer}.quiet:hover,.text-button:hover{border-color:#b9f27c}.danger{background:#ff795e;border-color:#ff795e;color:#160906;font-weight:750}.text-button{padding:.35rem .55rem;font-size:.75rem}.merge-preview{margin-top:1.8rem}.notice{min-height:1.5rem;color:#ffd0c5}.danger-zone{padding-bottom:1.5rem}@media(max-width:640px){.section-intro{grid-template-columns:2rem 1fr}.subject-line,.migration-row{align-items:flex-start;flex-direction:column}.subject-line code{overflow-wrap:anywhere}.disposition{width:100%;justify-content:space-between;text-align:left}}
+  .ledger{border-top:1px solid #2b2f2c;padding:2.4rem 0 3.6rem}
+  .section-intro{display:grid;grid-template-columns:3rem 1fr;gap:1rem;align-items:start}
+  .section-intro>span{color:#b9f27c;font:700 .72rem/1 ui-monospace,monospace}
+  .section-intro h2{font-size:clamp(1.55rem,3vw,2.35rem);letter-spacing:-.045em;margin:-.25rem 0 .4rem}
+  .section-intro p,.muted{color:#969c96;line-height:1.55;margin:0}
+  .account-loading{color:#b9f27c;padding:3rem 0}
+  .account-error,.migration-unavailable{border:1px solid #4c403b;background:#1d1b19;padding:1.25rem;margin:1.5rem 0}
+  .account-error strong,.migration-unavailable strong{font-size:1.05rem}
+  .account-error p,.migration-unavailable p{color:#aaa49e;line-height:1.5;margin:.45rem 0 0}
+  .account-summary{display:flex;align-items:center;gap:1rem;margin:2rem 0 1.5rem}
+  .account-summary>div:last-child{display:flex;flex-direction:column;gap:.24rem}
+  .account-summary strong{font-size:1.2rem;overflow-wrap:anywhere}
+  .account-summary span{color:#b9f27c;font-size:.76rem;letter-spacing:.06em;text-transform:uppercase}
+  .avatar{width:3.2rem;height:3.2rem;display:grid;place-items:center;flex:0 0 auto;border-radius:50%;background:#b9f27c;color:#11150f;font-size:1.25rem;font-weight:800;overflow:hidden}
+  .avatar img{width:100%;height:100%;object-fit:cover}
+  .profile-form{border-top:1px solid #272b28;padding-top:1.25rem}
+  .profile-form>label,.add-methods>strong{display:block;margin-bottom:.55rem;font-size:.8rem;letter-spacing:.06em;text-transform:uppercase}
+  .field-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.65rem}
+  .field-row input{min-width:0;min-height:3rem;border:1px solid #393e3a;border-radius:.25rem;background:#171a18;color:#f5f4ef;padding:.7rem .85rem;font:inherit}
+  .save,.sign-out{min-height:3rem;border-radius:.25rem;padding:.7rem 1rem;font:inherit;font-weight:750;cursor:pointer}
+  .save{border:1px solid #b9f27c;background:#b9f27c;color:#11150f}
+  .sign-out{border:1px solid #4a4f4a;background:transparent;color:#f5f4ef;margin-top:1.4rem}
+  .profile-metadata{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem;margin-top:1.25rem}
+  .profile-metadata>div{display:flex;min-width:0;flex-direction:column;gap:.25rem;border-top:1px solid #272b28;padding-top:.85rem}
+  .profile-metadata span,.credential>span,.migration-row span{color:#858b85;font-size:.72rem;text-transform:uppercase;letter-spacing:.09em}
+  .profile-metadata strong,.profile-metadata code,.credential strong{overflow-wrap:anywhere}
+  .profile-metadata code{color:#c8cec8;font-size:.76rem}
+  .profile-metadata small,.credential small{color:#747a74;line-height:1.4}
+  .credential-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(13rem,1fr));border-bottom:1px solid #272b28;margin-top:1.7rem}
+  .credential{display:flex;flex-direction:column;gap:.35rem;padding:1rem 1rem 1rem 0;border-top:1px solid #272b28}
+  .credential-empty{color:#969c96;margin:0;padding:1rem 0;border-top:1px solid #272b28}
+  .add-methods{margin-top:1.7rem}
+  .primary-action{width:100%;min-height:3.25rem;display:flex;justify-content:space-between;align-items:center;margin-top:2rem;padding:1rem 1.2rem;border:0;border-radius:.25rem;background:#b9f27c;color:#11150f;font-weight:790;cursor:pointer}
+  .primary-action:hover,.save:hover{background:#c8ff8b}
+  .primary-action:disabled,button:disabled{opacity:.48;cursor:not-allowed}
+  .claim{margin-top:2rem}
+  .claim-head,.migration-row{display:flex;justify-content:space-between;align-items:center;gap:1rem;border-top:1px solid #272b28;padding:1rem 0}
+  .claim-head time{color:#747a74;font-size:.8rem}
+  .migration-row>div:first-child{display:flex;flex-direction:column;gap:.25rem}
+  .disposition{display:flex;align-items:center;gap:1rem;text-align:right}
+  .disposition>[data-state]{color:#aab0aa}
+  .disposition>[data-state=linked],.disposition>[data-state=already_linked]{color:#b9f27c}
+  .disposition>[data-state=conflict]{color:#ff9a84}
+  .button-row{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1.2rem}
+  .quiet,.danger,.text-button{min-height:2.75rem;border:1px solid #393e3a;background:transparent;color:#f5f4ef;border-radius:.25rem;padding:.72rem 1rem;font:inherit;cursor:pointer;text-decoration:none}
+  .quiet:hover,.text-button:hover,.sign-out:hover{border-color:#b9f27c}
+  .link-button{display:inline-flex;align-items:center}
+  .danger{background:#ff795e;border-color:#ff795e;color:#160906;font-weight:750}
+  .text-button{min-height:2.4rem;padding:.35rem .55rem;font-size:.75rem}
+  .merge-preview{margin-top:1.8rem}
+  .notice{margin:0 0 1rem;border:1px solid #5b4c45;border-radius:.25rem;background:#201d1a;color:#ffd0c5;padding:.8rem 1rem}
+  .danger-zone{padding-bottom:1.5rem}
+  button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid #b9f27c;outline-offset:3px}
+  @media(max-width:640px){
+    .ledger{padding:2rem 0 2.8rem}
+    .section-intro{grid-template-columns:2rem 1fr}
+    .field-row,.profile-metadata{grid-template-columns:1fr}
+    .field-row .save,.sign-out,.button-row .quiet,.button-row .danger{width:100%}
+    .migration-row{align-items:flex-start;flex-direction:column}
+    .disposition{width:100%;justify-content:space-between;text-align:left}
+  }
 `;
 
 async function injectedSolanaSigner(): Promise<SolanaSigner> {
@@ -682,22 +1071,4 @@ function requireExactSignedMessage(requested: Uint8Array, signed?: Uint8Array) {
 const solanaConnectors = toSolanaWalletConnectors({ shouldAutoConnect: false });
 
 const root = createRoot(document.getElementById("account-root")!);
-root.render(
-  config.privyAppId ? (
-    <PrivyProvider
-      appId={config.privyAppId}
-      config={{
-        appearance: {
-          theme: "dark",
-          accentColor: "#B9F27C",
-          walletChainType: "ethereum-and-solana",
-        },
-        externalWallets: { solana: { connectors: solanaConnectors } },
-      }}
-    >
-      <AccountApp />
-    </PrivyProvider>
-  ) : (
-    <AccountApp />
-  ),
-);
+root.render(<AccountApp />);

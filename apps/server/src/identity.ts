@@ -114,6 +114,34 @@ export async function identityMe(
   };
 }
 
+export async function updateIdentityProfile(
+  db: IdentityDb,
+  input: {
+    displayName: string;
+    subject: string;
+  },
+): Promise<IdentityMeResponse> {
+  return db.transaction(async (transaction) => {
+    const [identityUser] = await transaction
+      .select({ id: user.id, status: user.status })
+      .from(user)
+      .where(eq(user.id, input.subject))
+      .for("update")
+      .limit(1);
+    if (identityUser === undefined || identityUser.status !== "active") {
+      throw new IdentityNotFoundError();
+    }
+    await transaction
+      .update(user)
+      .set({
+        name: input.displayName,
+        updatedAt: new Date(),
+      })
+      .where(eq(user.id, input.subject));
+    return identityMe(transaction, input.subject);
+  });
+}
+
 function isSocialProvider(value: string): value is SocialProvider {
   return SOCIAL_PROVIDERS.has(value as SocialProvider);
 }
