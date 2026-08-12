@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   IdentityMeResponseSchema,
+  PeezyHandleSchema,
   PeezyUserSchema,
   SolanaAddressSchema,
   WalletCredentialSchema,
@@ -14,6 +15,13 @@ const user = {
 };
 
 describe("identity contracts", () => {
+  test("normalizes globally safe peezy.tech handles", () => {
+    expect(PeezyHandleSchema.parse("Peezy-Tech")).toBe("peezy-tech");
+    for (const value of ["ab", "-peezy", "peezy_tech", "peezy-"]) {
+      expect(() => PeezyHandleSchema.parse(value)).toThrow();
+    }
+  });
+
   test("allows a user with no wallet credential", () => {
     expect(
       IdentityMeResponseSchema.parse({

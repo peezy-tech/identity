@@ -19,6 +19,7 @@ export const user = pgTable(
       .primaryKey()
       .default(sql`gen_random_uuid()::text`),
     name: text("name").notNull(),
+    handle: text("handle"),
     email: text("email").notNull().unique(),
     emailVerified: boolean("email_verified").default(false).notNull(),
     image: text("image"),
@@ -30,6 +31,11 @@ export const user = pgTable(
       .notNull(),
   },
   (table) => [
+    uniqueIndex("user_handle_uidx").on(table.handle),
+    check(
+      "user_handle_check",
+      sql`${table.handle} IS NULL OR ${table.handle} ~ '^[a-z][a-z0-9-]{1,30}[a-z0-9]$'`,
+    ),
     check(
       "user_status_check",
       sql`${table.status} IN ('active', 'disabled', 'merged')`,

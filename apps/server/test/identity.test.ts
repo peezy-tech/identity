@@ -10,6 +10,7 @@ describe("identity user projection", () => {
       createdAt: new Date("2026-07-29T00:00:00.000Z"),
       email: "not-an-email",
       emailVerified: false,
+      handle: null,
       id: "ca83177c-f524-4775-a82f-c86ede030b11",
       image: "not-a-url",
       name: `  ${"x".repeat(200)}  `,
@@ -28,6 +29,7 @@ describe("identity user projection", () => {
         createdAt: new Date("2026-07-29T00:00:00.000Z"),
         email: "person@example.com",
         emailVerified: true,
+        handle: "person",
         id: "cd08002b-2cd9-4eff-984c-c03accdf1580",
         image: "https://example.com/avatar.png",
         name: "Person",
@@ -40,6 +42,7 @@ describe("identity user projection", () => {
         value: "person@example.com",
         verified: true,
       },
+      handle: "person",
     });
   });
 });

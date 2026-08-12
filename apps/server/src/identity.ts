@@ -7,6 +7,7 @@ import { eq } from "drizzle-orm";
 
 import type { IdentityDb } from "./db/client";
 import { account, user, walletAddress, walletPrincipal } from "./db/schema";
+import { parseAvailableHandle, ReservedHandleError } from "./handles";
 import { toPeezyUser } from "./wallet-grants";
 
 const SOCIAL_PROVIDERS = new Set<SocialProvider>([
@@ -21,6 +22,17 @@ export class IdentityNotFoundError extends Error {
   constructor() {
     super("Identity account was not found");
     this.name = "IdentityNotFoundError";
+  }
+}
+
+export class IdentityProfileError extends Error {
+  readonly code: "handle_immutable" | "handle_reserved" | "handle_taken";
+  readonly status = 409 as const;
+
+  constructor(code: IdentityProfileError["code"], message: string) {
+    super(message);
+    this.name = "IdentityProfileError";
+    this.code = code;
   }
 }
 
@@ -118,28 +130,75 @@ export async function updateIdentityProfile(
   db: IdentityDb,
   input: {
     displayName: string;
+    handle?: string;
     subject: string;
   },
 ): Promise<IdentityMeResponse> {
-  return db.transaction(async (transaction) => {
-    const [identityUser] = await transaction
-      .select({ id: user.id, status: user.status })
-      .from(user)
-      .where(eq(user.id, input.subject))
-      .for("update")
-      .limit(1);
-    if (identityUser === undefined || identityUser.status !== "active") {
-      throw new IdentityNotFoundError();
+  let requestedHandle: string | undefined;
+  if (input.handle !== undefined) {
+    try {
+      requestedHandle = parseAvailableHandle(input.handle);
+    } catch (error) {
+      if (error instanceof ReservedHandleError) {
+        throw new IdentityProfileError(
+          "handle_reserved",
+          "This peezy.tech handle is reserved",
+        );
+      }
+      throw error;
     }
-    await transaction
-      .update(user)
-      .set({
-        name: input.displayName,
-        updatedAt: new Date(),
-      })
-      .where(eq(user.id, input.subject));
-    return identityMe(transaction, input.subject);
-  });
+  }
+
+  try {
+    return await db.transaction(async (transaction) => {
+      const [identityUser] = await transaction
+        .select({ handle: user.handle, id: user.id, status: user.status })
+        .from(user)
+        .where(eq(user.id, input.subject))
+        .for("update")
+        .limit(1);
+      if (identityUser === undefined || identityUser.status !== "active") {
+        throw new IdentityNotFoundError();
+      }
+      if (
+        requestedHandle !== undefined &&
+        identityUser.handle !== null &&
+        identityUser.handle !== requestedHandle
+      ) {
+        throw new IdentityProfileError(
+          "handle_immutable",
+          "peezy.tech handles cannot be changed after they are claimed",
+        );
+      }
+      await transaction
+        .update(user)
+        .set({
+          ...(requestedHandle === undefined ? {} : { handle: requestedHandle }),
+          name: input.displayName,
+          updatedAt: new Date(),
+        })
+        .where(eq(user.id, input.subject));
+      return identityMe(transaction, input.subject);
+    });
+  } catch (error) {
+    if (postgresErrorCode(error) === "23505") {
+      throw new IdentityProfileError(
+        "handle_taken",
+        "This peezy.tech handle is already claimed",
+      );
+    }
+    throw error;
+  }
+}
+
+function postgresErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return typeof error === "object" && error !== null && "cause" in error
+      ? postgresErrorCode(error.cause)
+      : undefined;
+  }
+  if (typeof error.code === "string") return error.code;
+  return "cause" in error ? postgresErrorCode(error.cause) : undefined;
 }
 
 function isSocialProvider(value: string): value is SocialProvider {

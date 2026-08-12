@@ -3,6 +3,14 @@ import { z } from "zod";
 
 export const IdentitySubjectSchema = z.string().uuid();
 export const IsoDateSchema = z.string().datetime();
+export const PeezyHandleSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .regex(/^[a-z][a-z0-9-]{1,30}[a-z0-9]$/, {
+    message:
+      "Use 3-32 lowercase letters, numbers, or hyphens; start with a letter and end with a letter or number",
+  });
 export const EvmAddressSchema = z
   .string()
   .regex(/^0x[a-fA-F0-9]{40}$/)
@@ -31,6 +39,7 @@ export const PeezyUserSchema = z.object({
   avatarUrl: HttpUrlSchema.optional(),
   createdAt: IsoDateSchema,
   displayName: z.string().trim().min(1).max(128).optional(),
+  handle: PeezyHandleSchema.optional(),
   id: IdentitySubjectSchema,
   primaryEmail: z
     .object({

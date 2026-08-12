@@ -65,6 +65,7 @@ const oidcClientSchema = z.object({
   clientSecret: z.string().min(32),
   name: z.string().trim().min(1).max(128),
   redirectUris: z.array(webUrl).min(1),
+  requireHandle: z.boolean().default(false),
 });
 
 function jsonEnv<T extends z.ZodType>(

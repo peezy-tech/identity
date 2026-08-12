@@ -31,6 +31,7 @@ type Identity = {
     avatarUrl?: string;
     createdAt: string;
     displayName?: string;
+    handle?: string;
     id: string;
     primaryEmail?: { value: string; verified: boolean };
   };
@@ -135,6 +136,7 @@ function AccountApp() {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string>("");
   const [mergePreview, setMergePreview] = useState<MergePreview | null>(null);
+  const [profileHandle, setProfileHandle] = useState("");
   const [profileName, setProfileName] = useState("");
 
   async function refreshIdentity() {
@@ -142,6 +144,7 @@ function AccountApp() {
       const nextIdentity = await requestJson<Identity>("/v1/me");
       setIdentity(nextIdentity);
       setIdentityError(null);
+      setProfileHandle(nextIdentity.user.handle ?? "");
       setProfileName(nextIdentity.user.displayName ?? "");
     } catch (error) {
       setIdentityError(errorMessage(error));
@@ -203,21 +206,42 @@ function AccountApp() {
 
   async function saveProfile(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (identity === null) return;
     setBusy("profile");
     setNotice("");
     try {
       const nextIdentity = await requestJson<Identity>("/v1/account/profile", {
         method: "POST",
-        body: JSON.stringify({ displayName: profileName }),
+        body: JSON.stringify({
+          displayName: profileName,
+          ...(identity.user.handle === undefined
+            ? { handle: profileHandle }
+            : {}),
+        }),
       });
       setIdentity(nextIdentity);
+      setProfileHandle(nextIdentity.user.handle ?? "");
       setProfileName(nextIdentity.user.displayName ?? "");
       setNotice("Profile saved.");
+      const returnTo = oidcReturnPath();
+      if (nextIdentity.user.handle !== undefined && returnTo !== undefined) {
+        location.assign(
+          `/oidc/resume?return_to=${encodeURIComponent(returnTo)}`,
+        );
+      }
     } catch (error) {
       showError(error);
     } finally {
       setBusy(null);
     }
+  }
+
+  function oidcReturnPath(): string | undefined {
+    const value = new URLSearchParams(location.search).get("return_to");
+    if (value === null || !value.startsWith("/api/auth/oauth2/authorize?")) {
+      return undefined;
+    }
+    return value;
   }
 
   async function signOut() {
@@ -486,7 +510,11 @@ function AccountApp() {
                 identity.user.primaryEmail?.value ??
                 "peezy.tech account"}
             </strong>
-            <span>Signed in to peezy.tech Identity</span>
+            <span>
+              {identity.user.handle === undefined
+                ? "Signed in to peezy.tech Identity"
+                : `@${identity.user.handle}`}
+            </span>
           </div>
         </div>
         <form className="profile-form" onSubmit={saveProfile}>
@@ -507,6 +535,28 @@ function AccountApp() {
               {busy === "profile" ? "Saving…" : "Save profile"}
             </button>
           </div>
+          <label htmlFor="peezy-handle">peezy.tech handle</label>
+          <div className="field-row">
+            <input
+              autoCapitalize="none"
+              autoCorrect="off"
+              disabled={busy !== null || identity.user.handle !== undefined}
+              id="peezy-handle"
+              maxLength={32}
+              minLength={3}
+              onChange={(event) => setProfileHandle(event.target.value)}
+              pattern="[a-z][a-z0-9-]{1,30}[a-z0-9]"
+              placeholder="peezy"
+              required={identity.user.handle === undefined}
+              spellCheck={false}
+              value={profileHandle}
+            />
+          </div>
+          <small className="handle-note">
+            {identity.user.handle === undefined
+              ? "Your global handle becomes permanent when you save it. Jojo Build and other peezy.tech products may use it in profile URLs."
+              : "Global handle · permanent · shared with connected peezy.tech products"}
+          </small>
           <div className="profile-metadata">
             <div>
               <span>Email</span>
@@ -994,6 +1044,8 @@ const styles = `
   .avatar img{width:100%;height:100%;object-fit:cover}
   .profile-form{border-top:1px solid #272b28;padding-top:1.25rem}
   .profile-form>label,.add-methods>strong{display:block;margin-bottom:.55rem;font-size:.8rem;letter-spacing:.06em;text-transform:uppercase}
+  .profile-form>label:not(:first-child){margin-top:1.1rem}
+  .handle-note{display:block;margin-top:.55rem;color:#858b85;line-height:1.45}
   .field-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.65rem}
   .field-row input{min-width:0;min-height:3rem;border:1px solid #393e3a;border-radius:.25rem;background:#171a18;color:#f5f4ef;padding:.7rem .85rem;font:inherit}
   .save,.sign-out{min-height:3rem;border-radius:.25rem;padding:.7rem 1rem;font:inherit;font-weight:750;cursor:pointer}

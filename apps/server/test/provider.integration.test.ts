@@ -9,6 +9,7 @@ import { resolve } from "node:path";
 
 import {
   IdentityMeResponseSchema,
+  PeezyHandleSchema,
   WalletChallengeResponseSchema,
   WalletGrantExchangeResponseSchema,
   WalletGrantResponseSchema,
@@ -104,6 +105,7 @@ if (databaseUrl === undefined) {
           clientSecret: oidcSecret,
           name: "PledgeCash",
           redirectUris: ["https://pledge.test/auth/callback/peezy"],
+          requireHandle: false,
         },
       ],
       port: 8790,
@@ -354,6 +356,41 @@ if (databaseUrl === undefined) {
         user: { displayName: "Peezy Operator", id: signedIn.userId },
       });
 
+      const claimed = await update({
+        displayName: "Peezy Operator",
+        handle: "peezy-operator",
+      });
+      expect(claimed.status).toBe(200);
+      expect(await claimed.json()).toMatchObject({
+        user: { handle: "peezy-operator", id: signedIn.userId },
+      });
+      expect(
+        (
+          await update({
+            displayName: "Peezy Operator",
+            handle: "different-handle",
+          })
+        ).status,
+      ).toBe(409);
+
+      const other = await signInHostedWallet(
+        app,
+        config,
+        privateKeyToAccount(`0x${randomBytes(32).toString("hex")}`),
+      );
+      expect(
+        (
+          await update(
+            { displayName: "Other", handle: "peezy-operator" },
+            other.cookie,
+          )
+        ).status,
+      ).toBe(409);
+      expect(
+        (await update({ displayName: "Other", handle: "admin" }, other.cookie))
+          .status,
+      ).toBe(409);
+
       expect((await update({ displayName: "" })).status).toBe(400);
       expect(
         (await update({ displayName: "Nope", unexpected: true })).status,
@@ -391,6 +428,76 @@ if (databaseUrl === undefined) {
       expect(afterSignOut.headers.get("location")).toBe(
         "/sign-in?return_to=%2Faccount",
       );
+    });
+
+    test("emits a claimed global handle as preferred_username", async () => {
+      const oidcWallet = privateKeyToAccount(
+        `0x${randomBytes(32).toString("hex")}`,
+      );
+      const signedIn = await signInHostedWallet(app, config, oidcWallet);
+      const handleRequiredApp = createIdentityApp({
+        auth: identityAuth,
+        config: {
+          ...config,
+          oidcClients: config.oidcClients.map((client) => ({
+            ...client,
+            requireHandle: true,
+          })),
+        },
+        db: database.db,
+        privyGateway,
+        proofAuth: identityProofAuth,
+        socialProviderNames: ["github"],
+      });
+      const gated = await handleRequiredApp.request(
+        "https://identity.test/api/auth/oauth2/authorize?client_id=pledge-cash&response_type=code&redirect_uri=https%3A%2F%2Fpledge.test%2Fauth%2Fcallback%2Fpeezy",
+        { headers: { Cookie: signedIn.cookie } },
+      );
+      expect(gated.status).toBe(302);
+      expect(gated.headers.get("location")).toStartWith("/account?return_to=");
+      await database.db
+        .update(user)
+        .set({ handle: "jojo-user", updatedAt: new Date() })
+        .where(eq(user.id, signedIn.userId));
+      expect(PeezyHandleSchema.parse("Jojo-User")).toBe("jojo-user");
+
+      const authorization = await authorizeCode({
+        app: handleRequiredApp,
+        identityCookie: signedIn.cookie,
+        resource: "https://api.pledge.test",
+      });
+      const tokenResponse = await exchangeAuthorizationCode({
+        app: handleRequiredApp,
+        code: authorization.code,
+        codeVerifier: authorization.codeVerifier,
+        oidcSecret,
+        resource: "https://api.pledge.test",
+      });
+      expect(tokenResponse.status).toBe(200);
+      const tokens = (await tokenResponse.json()) as {
+        access_token: string;
+        id_token: string;
+      };
+      expect(decodeJwt(tokens.id_token)).toMatchObject({
+        preferred_username: "jojo-user",
+        sub: signedIn.userId,
+      });
+      const userInfo = await handleRequiredApp.request(
+        "https://identity.test/api/auth/oauth2/userinfo",
+        { headers: { Authorization: `Bearer ${tokens.access_token}` } },
+      );
+      expect(userInfo.status).toBe(200);
+      expect(await userInfo.json()).toMatchObject({
+        preferred_username: "jojo-user",
+        sub: signedIn.userId,
+      });
+
+      const metadata = (await (
+        await handleRequiredApp.request(
+          "https://identity.test/api/auth/.well-known/openid-configuration",
+        )
+      ).json()) as { claims_supported: string[] };
+      expect(metadata.claims_supported).toContain("preferred_username");
     });
 
     test("uses the core social-link endpoint for Telegram", async () => {

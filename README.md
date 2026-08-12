@@ -7,6 +7,9 @@ Social accounts and wallets are credentials attached to that subject; a wallet
 is never required to create an account. Verified email is exposed as an
 identity attribute when a social provider supplies it. Passkeys are reserved as
 a future credential type in the public contract, but are not enabled in v0.1.
+An account may also claim one permanent, globally unique peezy.tech handle.
+OIDC clients receive it as `preferred_username` while continuing to authenticate
+the person by the stable issuer and subject.
 
 The provider exposes OAuth 2.1 / OpenID Connect for normal application sign-in,
 hosted EVM SIWE and Solana SIWS sign-in, and a bounded EVM wallet-grant flow for

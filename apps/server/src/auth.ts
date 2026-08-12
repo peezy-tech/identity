@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 
+import { PeezyHandleSchema } from "@peezy.tech/identity";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { betterAuth, type BetterAuthPlugin } from "better-auth";
@@ -88,6 +89,25 @@ function createConfiguredIdentityAuth(
   ];
   const providerPlugin = oauthProvider({
     accessTokenExpiresIn: 10 * 60,
+    advertisedMetadata: {
+      claims_supported: [
+        "sub",
+        "iss",
+        "aud",
+        "exp",
+        "iat",
+        "sid",
+        "scope",
+        "azp",
+        "name",
+        "picture",
+        "given_name",
+        "family_name",
+        "email",
+        "email_verified",
+        "preferred_username",
+      ],
+    },
     cachedResources: new Set(resourceAudiences),
     cachedTrustedClients: new Set(
       config.oidcClients.map((client) => client.clientId),
@@ -95,6 +115,10 @@ function createConfiguredIdentityAuth(
     clientPrivileges: () => false,
     codeExpiresIn: 5 * 60,
     consentPage: "/consent",
+    customIdTokenClaims: ({ scopes, user }) =>
+      preferredUsernameClaims(user, scopes),
+    customUserInfoClaims: ({ scopes, user }) =>
+      preferredUsernameClaims(user, scopes),
     enforcePerClientResources: true,
     idTokenExpiresIn: 10 * 60,
     loginPage: "/sign-in",
@@ -118,6 +142,11 @@ function createConfiguredIdentityAuth(
     disabledPaths: ["/unlink-account"],
     user: {
       additionalFields: {
+        handle: {
+          input: false,
+          required: false,
+          type: "string",
+        },
         status: {
           defaultValue: "active",
           input: false,
@@ -249,6 +278,15 @@ function createConfiguredIdentityAuth(
   });
 
   return { auth, socialProviderNames };
+}
+
+function preferredUsernameClaims(
+  user: Record<string, unknown>,
+  scopes: readonly string[],
+): Record<string, string> {
+  if (!scopes.includes("profile")) return {};
+  const handle = PeezyHandleSchema.safeParse(user.handle);
+  return handle.success ? { preferred_username: handle.data } : {};
 }
 
 function createIdentityDatabaseAdapter(
