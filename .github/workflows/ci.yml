@@ -37,6 +37,7 @@ jobs:
       - run: bun run format:check
       - run: bun run typecheck
       - run: bun run test
+      - run: bun run test:vendor-shamir
       - run: bun run build
       - run: bun run package:smoke
       - run: docker build --tag peezy-tech-identity:ci .

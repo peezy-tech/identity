@@ -1,0 +1,157 @@
+{
+  "vendors": {
+    "shamir-secret-sharing": {
+      "candidate": {
+        "base": "3d8620f85ecd1259febb5fe7a582268e27011f48",
+        "ref": "refs/heads/candidate/vendor/shamir-secret-sharing/73bbf04da63532a57a29353715183c6051d23c2c"
+      },
+      "canonicalUpstream": {
+        "cloneUrl": "https://github.com/privy-io/shamir-secret-sharing.git",
+        "defaultBranch": "main",
+        "fork": false,
+        "forkNetworkRootId": "590752009",
+        "fullName": "privy-io/shamir-secret-sharing",
+        "htmlUrl": "https://github.com/privy-io/shamir-secret-sharing",
+        "name": "shamir-secret-sharing",
+        "nodeId": "R_kgDOIzYpCQ",
+        "owner": "privy-io",
+        "provider": "github",
+        "repositoryId": "590752009"
+      },
+      "direct": false,
+      "licenses": [
+        {
+          "digest": "c8e3e7049fce8e181ae7c80fb735652a916c99614dfb022cf0d516341559086a",
+          "path": "vendor/privy-io/shamir-secret-sharing/LICENSE"
+        }
+      ],
+      "name": "shamir-secret-sharing",
+      "outputDigest": "3fe06931ed4a660e5445ba0707560cc7d8c94eea2e381118556140846d93cb02",
+      "ownedCommit": {
+        "sha": "73bbf04da63532a57a29353715183c6051d23c2c",
+        "tree": "133f994235ad6929616ae3ae578d21d5ee0ee613"
+      },
+      "ownedPaths": [
+        {
+          "blob": "65001e6e5b009689fc20cd90e4383dc787e9fd83",
+          "digest": "b0a27ab4146183d97062bf08d268db51018634de21685eb9c4237d5de953a956",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/.gitignore"
+        },
+        {
+          "blob": "4092dd0fd41411ebd3515117f543efc7ccb0263f",
+          "digest": "4285a44469a9b195f0952059131beabc38c04bb0edc97e21a27644d3cba4669c",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/.prettierrc"
+        },
+        {
+          "blob": "3091598dbf75944cdff631a3bcb6111db4972fc5",
+          "digest": "c8e3e7049fce8e181ae7c80fb735652a916c99614dfb022cf0d516341559086a",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/LICENSE"
+        },
+        {
+          "blob": "604b3640c4ca912fcceead7977b0343dd3ecdba6",
+          "digest": "3d78b74d04f32bec99a03a9e9f3b92d414eecfa063af48ad9323a31c32fd6e3c",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/README.md"
+        },
+        {
+          "blob": "2c50148f2612dbedc4814aa8fc78cb7ab66e9f60",
+          "digest": "304335b7505c329a21b1b9dda2d0c9dabfe5bef5e56018fea2c921bca697dafe",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/esm/package.json"
+        },
+        {
+          "blob": "e8847722733ac42dc6cfefb539f2a4b47abf5bbb",
+          "digest": "f2fe10ce9b14e33fc2863d32d683d8619eae31ccdb68b400f4c031be56c21f70",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/package-lock.json"
+        },
+        {
+          "blob": "9b4544a13ba87196dab1bbd125f252f8862ce431",
+          "digest": "29fd1b19f39ba605bfba6abc4a26ba4e3d29d4e2d297163808e813c0483db8ff",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/package.json"
+        },
+        {
+          "blob": "a850031ec4fdf83c1f785ee2186debcca726ac15",
+          "digest": "8a2f8a3737750192567ea6f723d5e81b72698598c705635ab3e461f2d3fb4b0b",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/src/csprng.node.ts"
+        },
+        {
+          "blob": "2d8f08e59b6459596fe91012a076bbc1f6111f03",
+          "digest": "dd5a6ad19d75c5ba0fa34bb7ab606e6e2d06784caa69eb78be2dc4a755966be3",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/src/csprng.ts"
+        },
+        {
+          "blob": "e9bbbd6bc016efd76ca18195f0a90c9ab271d48e",
+          "digest": "f5096daf3155502c27d0b7a703fa61e0bf26fda348f2a2f216872bf49498e050",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/src/index.ts"
+        },
+        {
+          "blob": "bf5daa3ff1513bab09239408a8d1451eadf5f0bb",
+          "digest": "0657fba135cfb187a112d58fb5cbcb4407b1badab4ba7f6808ceaa266a5db347",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/test/index.test.js"
+        },
+        {
+          "blob": "22294a28d66300547350c240d751fec347faa644",
+          "digest": "fb74af90122408ee56ff3251cdce6272f2af38c3c954e6e19283acf8eb662459",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/tsconfig.esm.json"
+        },
+        {
+          "blob": "ff1fae99fef9d48437ef2365f61ed0a83e30b536",
+          "digest": "cc1e1032852b1bac433ed2227b4bcc19d4770611ac8d2293d1511fb4026d7deb",
+          "mode": "100644",
+          "path": "vendor/privy-io/shamir-secret-sharing/tsconfig.json"
+        }
+      ],
+      "ownedSource": {
+        "cloneUrl": "https://github.com/peezy-tech/shamir-secret-sharing.git",
+        "defaultBranch": "main",
+        "fork": true,
+        "forkNetworkRootId": "590752009",
+        "fullName": "peezy-tech/shamir-secret-sharing",
+        "htmlUrl": "https://github.com/peezy-tech/shamir-secret-sharing",
+        "name": "shamir-secret-sharing",
+        "nodeId": "R_kgDOT2wj0g",
+        "owner": "peezy-tech",
+        "parentRepositoryId": "590752009",
+        "provider": "github",
+        "repositoryId": "1332487122"
+      },
+      "projection": {
+        "destination": "vendor/privy-io/shamir-secret-sharing",
+        "exclude": [
+          ".circleci/**",
+          ".forgejo/**",
+          ".git/**",
+          ".gitea/**",
+          ".github/**",
+          ".gitlab-ci.yml",
+          ".gitlab/**",
+          ".gitmodules",
+          "CODEOWNERS"
+        ],
+        "include": [
+          "**"
+        ],
+        "sourcePath": ".",
+        "strategy": "snapshot"
+      },
+      "recipeDigest": "5dd913074f9d022c291dde6e553e8363de287ef20f8d5ab2cd61455c2eed1c79",
+      "selector": "github:privy-io/shamir-secret-sharing",
+      "trackedRef": "main",
+      "upstreamCommit": {
+        "sha": "73bbf04da63532a57a29353715183c6051d23c2c",
+        "tree": "133f994235ad6929616ae3ae578d21d5ee0ee613"
+      }
+    }
+  },
+  "version": 1
+}

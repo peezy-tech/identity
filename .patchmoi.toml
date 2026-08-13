@@ -1,0 +1,13 @@
+# patch.moi:vendor shamir-secret-sharing begin
+[vendors."shamir-secret-sharing"]
+source = "github:privy-io/shamir-secret-sharing"
+to = "vendor/privy-io/shamir-secret-sharing"
+ref = "main"
+direct = false
+
+[vendors."shamir-secret-sharing".projection]
+strategy = "snapshot"
+sourcePath = "."
+include = ["**"]
+exclude = [".circleci/**", ".forgejo/**", ".git/**", ".gitea/**", ".github/**", ".gitlab-ci.yml", ".gitlab/**", ".gitmodules", "CODEOWNERS"]
+# patch.moi:vendor shamir-secret-sharing end
