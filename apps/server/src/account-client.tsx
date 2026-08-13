@@ -31,6 +31,7 @@ type Identity = {
     avatarUrl?: string;
     createdAt: string;
     displayName?: string;
+    handle?: string;
     id: string;
     primaryEmail?: { value: string; verified: boolean };
   };
@@ -53,6 +54,7 @@ type Claim = {
   claimedAt: string;
   id: string;
   identities: MigrationIdentity[];
+  privyUserId: string;
   privyUserHint: string;
 };
 type MergePreview = {
@@ -135,6 +137,7 @@ function AccountApp() {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string>("");
   const [mergePreview, setMergePreview] = useState<MergePreview | null>(null);
+  const [profileHandle, setProfileHandle] = useState("");
   const [profileName, setProfileName] = useState("");
 
   async function refreshIdentity() {
@@ -142,6 +145,7 @@ function AccountApp() {
       const nextIdentity = await requestJson<Identity>("/v1/me");
       setIdentity(nextIdentity);
       setIdentityError(null);
+      setProfileHandle(nextIdentity.user.handle ?? "");
       setProfileName(nextIdentity.user.displayName ?? "");
     } catch (error) {
       setIdentityError(errorMessage(error));
@@ -150,7 +154,6 @@ function AccountApp() {
   }
 
   async function refreshClaims() {
-    if (!config.privyAppId) return;
     try {
       const nextClaims = await requestJson<{ claims: Claim[] }>(
         "/v1/migrations/privy/claims/current",
@@ -203,21 +206,42 @@ function AccountApp() {
 
   async function saveProfile(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (identity === null) return;
     setBusy("profile");
     setNotice("");
     try {
       const nextIdentity = await requestJson<Identity>("/v1/account/profile", {
         method: "POST",
-        body: JSON.stringify({ displayName: profileName }),
+        body: JSON.stringify({
+          displayName: profileName,
+          ...(identity.user.handle === undefined
+            ? { handle: profileHandle }
+            : {}),
+        }),
       });
       setIdentity(nextIdentity);
+      setProfileHandle(nextIdentity.user.handle ?? "");
       setProfileName(nextIdentity.user.displayName ?? "");
       setNotice("Profile saved.");
+      const returnTo = oidcReturnPath();
+      if (nextIdentity.user.handle !== undefined && returnTo !== undefined) {
+        location.assign(
+          `/oidc/resume?return_to=${encodeURIComponent(returnTo)}`,
+        );
+      }
     } catch (error) {
       showError(error);
     } finally {
       setBusy(null);
     }
+  }
+
+  function oidcReturnPath(): string | undefined {
+    const value = new URLSearchParams(location.search).get("return_to");
+    if (value === null || !value.startsWith("/api/auth/oauth2/authorize?")) {
+      return undefined;
+    }
+    return value;
   }
 
   async function signOut() {
@@ -486,7 +510,11 @@ function AccountApp() {
                 identity.user.primaryEmail?.value ??
                 "peezy.tech account"}
             </strong>
-            <span>Signed in to peezy.tech Identity</span>
+            <span>
+              {identity.user.handle === undefined
+                ? "Signed in to peezy.tech Identity"
+                : `@${identity.user.handle}`}
+            </span>
           </div>
         </div>
         <form className="profile-form" onSubmit={saveProfile}>
@@ -507,6 +535,28 @@ function AccountApp() {
               {busy === "profile" ? "Saving…" : "Save profile"}
             </button>
           </div>
+          <label htmlFor="peezy-handle">peezy.tech handle</label>
+          <div className="field-row">
+            <input
+              autoCapitalize="none"
+              autoCorrect="off"
+              disabled={busy !== null || identity.user.handle !== undefined}
+              id="peezy-handle"
+              maxLength={32}
+              minLength={3}
+              onChange={(event) => setProfileHandle(event.target.value)}
+              pattern="[a-z][a-z0-9-]{1,30}[a-z0-9]"
+              placeholder="peezy"
+              required={identity.user.handle === undefined}
+              spellCheck={false}
+              value={profileHandle}
+            />
+          </div>
+          <small className="handle-note">
+            {identity.user.handle === undefined
+              ? "Your global handle becomes permanent when you save it. Jojo Build and other peezy.tech products may use it in profile URLs."
+              : "Global handle · permanent · shared with connected peezy.tech products"}
+          </small>
           <div className="profile-metadata">
             <div>
               <span>Email</span>
@@ -771,7 +821,28 @@ function PrivyMigrationPanel(props: {
   showError(error: unknown): void;
 }) {
   if (!config.privyAppId) {
-    return <p className="muted">Lobby import is currently unavailable.</p>;
+    return (
+      <>
+        <PrivyClaimList busy={props.busy} claims={props.claims} />
+        <p className="muted">
+          {props.claims.length > 0
+            ? "New Lobby imports are currently unavailable."
+            : "Lobby import is currently unavailable."}
+        </p>
+        {props.claimsError ? (
+          <div className="migration-unavailable" role="status">
+            <strong>Imported Lobby history could not be loaded.</strong>
+            <p>{props.claimsError}</p>
+            <button
+              className="quiet"
+              onClick={() => props.refreshClaims().catch(props.showError)}
+            >
+              Retry Lobby history
+            </button>
+          </div>
+        ) : null}
+      </>
+    );
   }
   return (
     <MigrationBoundary>
@@ -934,11 +1005,32 @@ function PrivyMigration(props: {
       >
         Continue with Privy to import <span>↗</span>
       </button>
+      <PrivyClaimList
+        busy={props.busy}
+        claims={props.claims}
+        verifyIdentity={verifyIdentity}
+        walletAddresses={walletAddresses}
+      />
+    </div>
+  );
+}
+
+function PrivyClaimList(props: {
+  busy: string | null;
+  claims: Claim[];
+  verifyIdentity?(item: MigrationIdentity): void;
+  walletAddresses?: ReadonlySet<string>;
+}) {
+  return (
+    <>
       {props.claims.map((claim) => (
         <div className="claim" key={claim.id}>
           <div className="claim-head">
-            <strong>Privy {claim.privyUserHint}</strong>
-            <time>{new Date(claim.claimedAt).toLocaleDateString()}</time>
+            <div>
+              <strong>Privy user ID</strong>
+              <code>{claim.privyUserId}</code>
+            </div>
+            <time>Linked {new Date(claim.claimedAt).toLocaleDateString()}</time>
           </div>
           {claim.identities.map((item) => (
             <div className="migration-row" key={item.id}>
@@ -951,14 +1043,15 @@ function PrivyMigration(props: {
                   {item.disposition.replaceAll("_", " ")}
                 </span>
                 {item.disposition === "needs_reverification" &&
-                (item.provider || item.walletAddress) ? (
+                (item.provider || item.walletAddress) &&
+                props.verifyIdentity !== undefined ? (
                   <button
                     className="text-button"
                     disabled={props.busy !== null}
-                    onClick={() => verifyIdentity(item)}
+                    onClick={() => props.verifyIdentity?.(item)}
                   >
                     {item.walletAddress &&
-                    walletAddresses.has(
+                    props.walletAddresses?.has(
                       item.chainType === "solana"
                         ? `solana:${item.walletAddress}`
                         : `evm:${item.walletAddress.toLowerCase()}`,
@@ -972,7 +1065,7 @@ function PrivyMigration(props: {
           ))}
         </div>
       ))}
-    </div>
+    </>
   );
 }
 
@@ -994,6 +1087,8 @@ const styles = `
   .avatar img{width:100%;height:100%;object-fit:cover}
   .profile-form{border-top:1px solid #272b28;padding-top:1.25rem}
   .profile-form>label,.add-methods>strong{display:block;margin-bottom:.55rem;font-size:.8rem;letter-spacing:.06em;text-transform:uppercase}
+  .profile-form>label:not(:first-child){margin-top:1.1rem}
+  .handle-note{display:block;margin-top:.55rem;color:#858b85;line-height:1.45}
   .field-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.65rem}
   .field-row input{min-width:0;min-height:3rem;border:1px solid #393e3a;border-radius:.25rem;background:#171a18;color:#f5f4ef;padding:.7rem .85rem;font:inherit}
   .save,.sign-out{min-height:3rem;border-radius:.25rem;padding:.7rem 1rem;font:inherit;font-weight:750;cursor:pointer}
@@ -1014,7 +1109,9 @@ const styles = `
   .primary-action:disabled,button:disabled{opacity:.48;cursor:not-allowed}
   .claim{margin-top:2rem}
   .claim-head,.migration-row{display:flex;justify-content:space-between;align-items:center;gap:1rem;border-top:1px solid #272b28;padding:1rem 0}
-  .claim-head time{color:#747a74;font-size:.8rem}
+  .claim-head>div{display:flex;min-width:0;flex-direction:column;gap:.3rem}
+  .claim-head code{color:#c8cec8;font-size:.76rem;overflow-wrap:anywhere}
+  .claim-head time{color:#747a74;font-size:.8rem;white-space:nowrap}
   .migration-row>div:first-child{display:flex;flex-direction:column;gap:.25rem}
   .disposition{display:flex;align-items:center;gap:1rem;text-align:right}
   .disposition>[data-state]{color:#aab0aa}
@@ -1035,7 +1132,7 @@ const styles = `
     .section-intro{grid-template-columns:2rem 1fr}
     .field-row,.profile-metadata{grid-template-columns:1fr}
     .field-row .save,.sign-out,.button-row .quiet,.button-row .danger{width:100%}
-    .migration-row{align-items:flex-start;flex-direction:column}
+    .claim-head,.migration-row{align-items:flex-start;flex-direction:column}
     .disposition{width:100%;justify-content:space-between;text-align:left}
   }
 `;

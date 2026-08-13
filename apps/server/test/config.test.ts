@@ -22,6 +22,7 @@ const oidcClient = {
   clientSecret: "oidc-secret-that-is-distinct-and-at-least-32-characters",
   name: "PledgeCash",
   redirectUris: ["https://api.pledge.cash/auth/oauth2/callback/peezy"],
+  requireHandle: true,
 };
 
 describe("Identity config", () => {
@@ -33,6 +34,7 @@ describe("Identity config", () => {
     });
     expect(config.appClients[0]?.secret).toBe(appClient.secret);
     expect(config.oidcClients[0]?.clientSecret).toBe(oidcClient.clientSecret);
+    expect(config.oidcClients[0]?.requireHandle).toBe(true);
 
     expect(() =>
       loadConfig({

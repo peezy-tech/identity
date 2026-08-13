@@ -143,6 +143,7 @@ export async function commitAccountMerge(input: {
       .select({
         email: user.email,
         emailVerified: user.emailVerified,
+        handle: user.handle,
         id: user.id,
         status: user.status,
       })
@@ -217,6 +218,16 @@ export async function commitAccountMerge(input: {
           emailVerified: source.emailVerified,
           updatedAt: new Date(),
         })
+        .where(eq(user.id, attempt.targetUserId));
+    }
+    if (source.handle !== null && target.handle === null) {
+      await transaction
+        .update(user)
+        .set({ handle: null, updatedAt: new Date() })
+        .where(eq(user.id, attempt.sourceUserId));
+      await transaction
+        .update(user)
+        .set({ handle: source.handle, updatedAt: new Date() })
         .where(eq(user.id, attempt.targetUserId));
     }
 

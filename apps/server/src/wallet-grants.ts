@@ -493,6 +493,7 @@ export function toPeezyUser(input: {
   createdAt: Date;
   email: string;
   emailVerified: boolean;
+  handle?: string | null;
   id: string;
   image: string | null;
   name: string;
@@ -509,6 +510,9 @@ export function toPeezyUser(input: {
   });
   return PeezyUserSchema.parse({
     createdAt: input.createdAt.toISOString(),
+    ...(input.handle === null || input.handle === undefined
+      ? {}
+      : { handle: input.handle }),
     id: input.id,
     status: input.status === "disabled" ? "disabled" : "active",
     ...(avatarUrl.success ? { avatarUrl: avatarUrl.data } : {}),

@@ -18,6 +18,7 @@ credential.
 The identity provider owns:
 
 - immutable global user subjects and lifecycle state;
+- globally unique, URL-safe peezy.tech handles and their reservation history;
 - social and wallet credentials, plus verified email attributes;
 - explicit credential linking and collision prevention;
 - identity sessions, OAuth grants, refresh-token rotation, and revocation;
@@ -35,6 +36,15 @@ Each product owns:
 
 Products store the opaque `sub` from this issuer. They do not read the identity
 database or use cross-service foreign keys.
+
+Every account may claim one lowercase peezy.tech handle. Handles are public
+profile identifiers, not authentication keys: products continue to bind the
+OIDC `issuer + sub`, while the provider exposes a claimed handle as
+`preferred_username` for display and product-local username provisioning.
+Handles are immutable in the first release. Disabled handles remain reserved;
+when accounts are merged, an otherwise handleless survivor inherits the source
+handle, while any additional source handle remains tombstoned on the merged
+subject.
 
 ## Protocol
 

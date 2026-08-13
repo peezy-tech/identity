@@ -71,6 +71,13 @@
       "when": 1786042642912,
       "tag": "0009_flimsy_red_ghost",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1786504796186,
+      "tag": "0010_clumsy_micromax",
+      "breakpoints": true
     }
   ]
 }

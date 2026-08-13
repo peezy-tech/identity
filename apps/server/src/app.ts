@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 
 import {
   IdentityCapabilitiesSchema,
+  PeezyHandleSchema,
   IdentitySubjectSchema,
   SocialLinkHandoffRequestSchema,
   WalletGrantIssueRequestSchema,
@@ -37,6 +38,7 @@ import { appClient, session } from "./db/schema";
 import {
   identityMe,
   IdentityNotFoundError,
+  IdentityProfileError,
   updateIdentityProfile,
 } from "./identity";
 import {
@@ -76,6 +78,7 @@ type IdentityConfigSocialProvider = keyof IdentityConfig["socialProviders"];
 const IdentityProfileUpdateSchema = z
   .object({
     displayName: z.string().trim().min(1).max(128),
+    handle: PeezyHandleSchema.optional(),
   })
   .strict();
 
@@ -165,12 +168,39 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
       accountSecurityHeaders(nonce),
     );
   });
+  app.get("/oidc/resume", async (context) => {
+    const returnTo = safeOidcAuthorizationPath(context.req.query("return_to"));
+    if (returnTo === undefined) {
+      return errorResponse(context, 400, "OIDC return path is invalid");
+    }
+    const identitySession = await dependencies.auth.api.getSession({
+      headers: context.req.raw.headers,
+    });
+    if (identitySession === null) {
+      return context.redirect(authorizationSignInPath(returnTo));
+    }
+    if (clientRequiresHandle(dependencies.config, returnTo)) {
+      const identity = await identityMe(
+        dependencies.db,
+        identitySession.user.id,
+      );
+      if (identity.user.handle === undefined) {
+        return context.redirect(
+          `/account?return_to=${encodeURIComponent(returnTo)}`,
+        );
+      }
+    }
+    return context.redirect(returnTo);
+  });
   app.get("/sign-in", async (context) => {
     const requestedReturn = safeReturnPath(context.req.query("return_to"));
+    const authorizationPath = `/api/auth/oauth2/authorize${new URL(context.req.url).search}`;
     const callbackPath =
       context.req.query("client_id") === undefined
         ? requestedReturn
-        : `/api/auth/oauth2/authorize${new URL(context.req.url).search}`;
+        : clientRequiresHandle(dependencies.config, authorizationPath)
+          ? `/oidc/resume?return_to=${encodeURIComponent(authorizationPath)}`
+          : authorizationPath;
     const identitySession = await dependencies.auth.api.getSession({
       headers: context.req.raw.headers,
     });
@@ -279,6 +309,7 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     return context.json(
       await updateIdentityProfile(dependencies.db, {
         displayName: body.displayName,
+        ...(body.handle === undefined ? {} : { handle: body.handle }),
         subject: identitySession.user.id,
       }),
     );
@@ -663,6 +694,26 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     );
   });
 
+  app.get("/api/auth/oauth2/authorize", async (context) => {
+    const authorizationPath = `${context.req.path}${new URL(context.req.url).search}`;
+    if (clientRequiresHandle(dependencies.config, authorizationPath)) {
+      const identitySession = await dependencies.auth.api.getSession({
+        headers: context.req.raw.headers,
+      });
+      if (identitySession !== null) {
+        const identity = await identityMe(
+          dependencies.db,
+          identitySession.user.id,
+        );
+        if (identity.user.handle === undefined) {
+          return context.redirect(
+            `/account?return_to=${encodeURIComponent(authorizationPath)}`,
+          );
+        }
+      }
+    }
+    return dependencies.auth.handler(context.req.raw);
+  });
   app.all("/api/auth", (context) => dependencies.auth.handler(context.req.raw));
   app.all("/api/auth/*", (context) =>
     dependencies.auth.handler(context.req.raw),
@@ -686,6 +737,9 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     }
     if (error instanceof IdentityNotFoundError) {
       return errorResponse(context, 404, error.message);
+    }
+    if (error instanceof IdentityProfileError) {
+      return errorResponse(context, error.status, error.message, error.code);
     }
     if (error instanceof PrivyMigrationError) {
       return errorResponse(context, error.status, error.message, error.code);
@@ -849,6 +903,31 @@ function safeReturnPath(value: string | undefined): string {
   } catch {
     return "/account";
   }
+}
+
+function safeOidcAuthorizationPath(
+  value: string | undefined,
+): string | undefined {
+  if (value === undefined) return undefined;
+  const path = safeReturnPath(value);
+  const target = new URL(path, "https://identity.invalid");
+  return target.pathname === "/api/auth/oauth2/authorize" ? path : undefined;
+}
+
+function authorizationSignInPath(authorizationPath: string): string {
+  const target = new URL(authorizationPath, "https://identity.invalid");
+  return `/sign-in${target.search}`;
+}
+
+function clientRequiresHandle(
+  config: IdentityConfig,
+  authorizationPath: string,
+): boolean {
+  const target = new URL(authorizationPath, "https://identity.invalid");
+  const clientId = target.searchParams.get("client_id");
+  return config.oidcClients.some(
+    (client) => client.clientId === clientId && client.requireHandle,
+  );
 }
 
 function accountSecurityHeaders(nonce: string): Record<string, string> {

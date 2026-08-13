@@ -60,6 +60,7 @@ export type PrivyMigrationClaimView = {
   claimedAt: string;
   id: string;
   identities: PrivyMigrationIdentityView[];
+  privyUserId: string;
   privyUserHint: string;
 };
 
@@ -459,6 +460,7 @@ export async function listCurrentPrivyClaims(
       identities: identityViews.sort((left, right) =>
         left.type.localeCompare(right.type),
       ),
+      privyUserId: claim.privyUserId,
       privyUserHint: privyUserHint(claim.privyUserId),
     });
   }
