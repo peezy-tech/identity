@@ -18,7 +18,10 @@ import React, {
 } from "react";
 import { createRoot } from "react-dom/client";
 
-import { isSignInCredential } from "./account-client-credentials";
+import {
+  isSignInCredential,
+  linkedSocialProviders,
+} from "./account-client-credentials";
 import {
   clearPendingPrivyMigrationAttempt,
   type PendingPrivyMigrationAttempt,
@@ -486,13 +489,7 @@ function AccountApp() {
       </>
     );
   }
-  const linkedProviders = new Set(
-    identity.credentials.flatMap((credential) =>
-      credential.kind === "social" && credential.provider
-        ? [credential.provider]
-        : [],
-    ),
-  );
+  const linkedProviders = linkedSocialProviders(identity.credentials);
   const signInCredentials = identity.credentials.filter(isSignInCredential);
   return (
     <>
@@ -760,11 +757,13 @@ function AccountApp() {
               {config.providers.map((provider) => (
                 <button
                   className="quiet"
-                  disabled={busy !== null}
+                  disabled={busy !== null || linkedProviders.has(provider)}
                   key={provider}
                   onClick={() => proveSocial(provider)}
                 >
-                  Prove with {providerLabel(provider)}
+                  {linkedProviders.has(provider)
+                    ? `${providerLabel(provider)} already linked`
+                    : `Prove with ${providerLabel(provider)}`}
                 </button>
               ))}
               <button
