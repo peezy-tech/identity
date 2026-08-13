@@ -1,6 +1,7 @@
 import {
   getAccessToken,
   PrivyProvider,
+  useLogin,
   usePrivy,
   useWallets,
 } from "@privy-io/react-auth";
@@ -8,10 +9,23 @@ import {
   toSolanaWalletConnectors,
   useWallets as useSolanaWallets,
 } from "@privy-io/react-auth/solana";
-import React, { useEffect, useMemo, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createRoot } from "react-dom/client";
 
 import { isSignInCredential } from "./account-client-credentials";
+import {
+  clearPendingPrivyMigrationAttempt,
+  type PendingPrivyMigrationAttempt,
+  readPendingPrivyMigrationAttempt,
+  type PrivyAttemptStorage,
+  writePendingPrivyMigrationAttempt,
+} from "./account-client-privy";
 import { selectEthereumAccount } from "./account-client-wallet";
 
 type Provider = "apple" | "discord" | "github" | "telegram" | "twitter";
@@ -690,10 +704,10 @@ function AccountApp() {
           claimsError={claimsError}
           linkSolanaWallet={linkSolanaWallet}
           linkWallet={linkWallet}
-          refresh={refresh}
           refreshClaims={refreshClaims}
           reverify={reverify}
           setBusy={setBusy}
+          setNotice={setNotice}
           showError={showError}
         />
       </section>
@@ -812,17 +826,18 @@ function PrivyMigrationPanel(props: {
   busy: string | null;
   claims: Claim[];
   claimsError: string | null;
-  refresh(): Promise<void>;
   refreshClaims(): Promise<void>;
   reverify(item: MigrationIdentity): void;
   linkWallet(addressHint?: string, provider?: EthereumProvider): Promise<void>;
   linkSolanaWallet(addressHint?: string, wallet?: SolanaSigner): Promise<void>;
   setBusy(value: string | null): void;
+  setNotice(value: string): void;
   showError(error: unknown): void;
 }) {
   if (!config.privyAppId) {
     return (
       <>
+        {props.claims.length > 0 ? <PrivyLinkedHeader /> : null}
         <PrivyClaimList busy={props.busy} claims={props.claims} />
         <p className="muted">
           {props.claims.length > 0
@@ -862,9 +877,10 @@ function PrivyMigrationPanel(props: {
           claims={props.claims}
           linkSolanaWallet={props.linkSolanaWallet}
           linkWallet={props.linkWallet}
-          refresh={props.refresh}
+          refreshClaims={props.refreshClaims}
           reverify={props.reverify}
           setBusy={props.setBusy}
+          setNotice={props.setNotice}
           showError={props.showError}
         />
         {props.claimsError ? (
@@ -887,26 +903,35 @@ function PrivyMigrationPanel(props: {
 function PrivyMigration(props: {
   busy: string | null;
   claims: Claim[];
-  refresh(): Promise<void>;
+  refreshClaims(): Promise<void>;
   reverify(item: MigrationIdentity): void;
   linkWallet(addressHint?: string, provider?: EthereumProvider): Promise<void>;
   linkSolanaWallet(addressHint?: string, wallet?: SolanaSigner): Promise<void>;
   setBusy(value: string | null): void;
+  setNotice(value: string): void;
   showError(error: unknown): void;
 }) {
   const {
     authenticated,
     getAccessToken: hookGetAccessToken,
-    login,
     logout,
     ready,
   } = usePrivy();
   const { wallets } = useWallets();
   const { wallets: solanaWallets } = useSolanaWallets();
-  const [attempt, setAttempt] = useState<{
-    attemptId: string;
-    csrfToken: string;
-  } | null>(null);
+  const storage = useMemo<PrivyAttemptStorage | null>(() => {
+    try {
+      return window.sessionStorage;
+    } catch {
+      return null;
+    }
+  }, []);
+  const [attempt, setAttempt] = useState<PendingPrivyMigrationAttempt | null>(
+    () => readPendingPrivyMigrationAttempt(storage),
+  );
+  const attemptRef = useRef(attempt);
+  const claimInFlightRef = useRef(false);
+  const lastSubmittedAttemptIdRef = useRef<string | null>(null);
   const walletAddresses = useMemo(
     () =>
       new Set([
@@ -916,38 +941,99 @@ function PrivyMigration(props: {
     [solanaWallets, wallets],
   );
 
-  useEffect(() => {
-    if (!ready || !authenticated || !attempt) return;
+  const rememberAttempt = useCallback(
+    (next: PendingPrivyMigrationAttempt | null) => {
+      attemptRef.current = next;
+      setAttempt(next);
+      if (next === null) {
+        clearPendingPrivyMigrationAttempt(storage);
+      } else {
+        writePendingPrivyMigrationAttempt(storage, next);
+      }
+    },
+    [storage],
+  );
+
+  const submitPendingClaim = useCallback(async () => {
+    const pending = attemptRef.current;
+    if (
+      pending === null ||
+      claimInFlightRef.current ||
+      lastSubmittedAttemptIdRef.current === pending.attemptId
+    ) {
+      return;
+    }
+    if (Date.parse(pending.expiresAt) <= Date.now()) {
+      rememberAttempt(null);
+      props.setNotice("Privy import expired. Start again to continue.");
+      return;
+    }
+    claimInFlightRef.current = true;
+    lastSubmittedAttemptIdRef.current = pending.attemptId;
     props.setBusy("privy-claim");
-    (async () => {
+    try {
       const token = (await hookGetAccessToken()) ?? (await getAccessToken());
       if (!token) throw new Error("Privy did not return an access token");
       await requestJson("/v1/migrations/privy/claims", {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
-        body: JSON.stringify(attempt),
+        body: JSON.stringify(pending),
       });
-      setAttempt(null);
-      await props.refresh();
-    })()
-      .catch(props.showError)
-      .finally(() => props.setBusy(null));
-  }, [authenticated, attempt, ready]);
+      rememberAttempt(null);
+      await props.refreshClaims();
+      props.setNotice(
+        "Lobby profile linked. Your Privy user ID is shown below.",
+      );
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (
+        code === "invalid_attempt" ||
+        code === "invalid_request" ||
+        code === "claimed_elsewhere"
+      ) {
+        rememberAttempt(null);
+      }
+      props.showError(error);
+    } finally {
+      claimInFlightRef.current = false;
+      props.setBusy(null);
+    }
+  }, [hookGetAccessToken, props, rememberAttempt]);
+
+  const { login } = useLogin({
+    onComplete: () => {
+      lastSubmittedAttemptIdRef.current = null;
+      void submitPendingClaim();
+    },
+    onError: (error) => {
+      props.setBusy(null);
+      props.showError(new Error(`Privy login failed (${error})`));
+    },
+  });
+
+  useEffect(() => {
+    if (!ready || !authenticated || !attempt) return;
+    void submitPendingClaim();
+  }, [authenticated, attempt, ready, submitPendingClaim]);
 
   async function start() {
     props.setBusy("privy-login");
+    props.setNotice("");
     try {
-      const next = await requestJson<{ attemptId: string; csrfToken: string }>(
-        "/v1/migrations/privy/attempts",
-        { method: "POST", body: "{}" },
-      );
-      if (authenticated) await logout();
-      setAttempt(next);
+      if (attemptRef.current === null) {
+        const next = await requestJson<PendingPrivyMigrationAttempt>(
+          "/v1/migrations/privy/attempts",
+          { method: "POST", body: "{}" },
+        );
+        if (authenticated) await logout();
+        rememberAttempt(next);
+      }
+      lastSubmittedAttemptIdRef.current = null;
       login();
     } catch (error) {
       props.showError(error);
     } finally {
-      props.setBusy(null);
+      if (!claimInFlightRef.current) props.setBusy(null);
     }
   }
 
@@ -998,19 +1084,53 @@ function PrivyMigration(props: {
 
   return (
     <div>
-      <button
-        className="primary-action"
-        disabled={!ready || props.busy !== null}
-        onClick={start}
-      >
-        Continue with Privy to import <span>↗</span>
-      </button>
-      <PrivyClaimList
-        busy={props.busy}
-        claims={props.claims}
-        verifyIdentity={verifyIdentity}
-        walletAddresses={walletAddresses}
-      />
+      {props.claims.length === 0 ? (
+        <>
+          <button
+            className="primary-action"
+            disabled={!ready || props.busy !== null}
+            onClick={start}
+          >
+            {attempt ? "Resume Privy import" : "Continue with Privy to import"}{" "}
+            <span>↗</span>
+          </button>
+          {attempt ? (
+            <p className="migration-pending" role="status">
+              Your Privy sign-in is pending. Continue to finish linking this
+              Lobby profile.
+            </p>
+          ) : null}
+        </>
+      ) : (
+        <>
+          <PrivyLinkedHeader />
+          <PrivyClaimList
+            busy={props.busy}
+            claims={props.claims}
+            verifyIdentity={verifyIdentity}
+            walletAddresses={walletAddresses}
+          />
+          <button
+            className="quiet migration-secondary"
+            disabled={!ready || props.busy !== null}
+            onClick={start}
+          >
+            Refresh or import another Privy profile
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function PrivyLinkedHeader() {
+  return (
+    <div className="migration-linked" role="status">
+      <span>Linked</span>
+      <div>
+        <strong>Lobby profile imported</strong>
+        <p>Your Privy account is linked to this peezy.tech identity.</p>
+      </div>
     </div>
   );
 }
@@ -1107,6 +1227,13 @@ const styles = `
   .primary-action{width:100%;min-height:3.25rem;display:flex;justify-content:space-between;align-items:center;margin-top:2rem;padding:1rem 1.2rem;border:0;border-radius:.25rem;background:#b9f27c;color:#11150f;font-weight:790;cursor:pointer}
   .primary-action:hover,.save:hover{background:#c8ff8b}
   .primary-action:disabled,button:disabled{opacity:.48;cursor:not-allowed}
+  .migration-pending{color:#aeb2ac;line-height:1.5;margin:.8rem 0 0}
+  .migration-linked{display:flex;align-items:flex-start;gap:1rem;margin-top:2rem;padding:1rem 0;border-top:1px solid #394038;border-bottom:1px solid #272b28}
+  .migration-linked>span{flex:0 0 auto;border:1px solid #54733c;border-radius:999px;background:#182414;color:#b9f27c;padding:.3rem .55rem;font-size:.68rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase}
+  .migration-linked>div{display:flex;flex-direction:column;gap:.3rem}
+  .migration-linked strong{font-size:1.05rem}
+  .migration-linked p{color:#969c96;line-height:1.5;margin:0}
+  .migration-secondary{margin-top:1rem}
   .claim{margin-top:2rem}
   .claim-head,.migration-row{display:flex;justify-content:space-between;align-items:center;gap:1rem;border-top:1px solid #272b28;padding:1rem 0}
   .claim-head>div{display:flex;min-width:0;flex-direction:column;gap:.3rem}
