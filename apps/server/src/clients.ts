@@ -71,6 +71,7 @@ export async function seedConfiguredClients(
     }
 
     for (const client of config.oidcClients) {
+      const publicBrowser = client.type === "public-browser";
       const existing = await transaction
         .select({ id: oauthClient.id })
         .from(oauthClient)
@@ -78,21 +79,25 @@ export async function seedConfiguredClients(
         .limit(1);
       const values = {
         clientId: client.clientId,
-        clientSecret: secretHash(client.clientSecret),
+        clientSecret: publicBrowser ? null : secretHash(client.clientSecret),
         disabled: false,
         enableEndSession: true,
-        grantTypes: ["authorization_code", "refresh_token"],
+        grantTypes: publicBrowser
+          ? ["authorization_code"]
+          : ["authorization_code", "refresh_token"],
         metadata: { managedBy: "config" },
         name: client.name,
-        public: false,
+        public: publicBrowser,
         redirectUris: client.redirectUris,
         requirePKCE: true,
         responseTypes: ["code"],
-        scopes: ["openid", "profile", "email", "offline_access"],
+        scopes: publicBrowser
+          ? ["openid", "profile"]
+          : ["openid", "profile", "email", "offline_access"],
         skipConsent: true,
         subjectType: "public",
-        tokenEndpointAuthMethod: "client_secret_basic",
-        type: "web",
+        tokenEndpointAuthMethod: publicBrowser ? "none" : "client_secret_basic",
+        type: publicBrowser ? "user-agent-based" : "web",
         updatedAt: now,
       };
       if (existing[0] === undefined) {

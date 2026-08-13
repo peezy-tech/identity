@@ -33,7 +33,22 @@ const webUrl = z
         message: "Expected HTTPS or a loopback HTTP URL without credentials",
       });
     }
+    if (url.hostname.includes("*")) {
+      context.addIssue({
+        code: "custom",
+        message: "Wildcard hosts are not allowed",
+      });
+    }
   });
+
+const redirectUrl = webUrl.superRefine((value, context) => {
+  if (new URL(value).hash.length > 0) {
+    context.addIssue({
+      code: "custom",
+      message: "Redirect URLs must not contain fragments",
+    });
+  }
+});
 
 const origin = webUrl.transform((value, context) => {
   const url = new URL(value);
@@ -56,17 +71,58 @@ const appClientSchema = z.object({
   walletLinkSiweStatement: z.string().trim().min(1).max(256).optional(),
 });
 
-const oidcClientSchema = z.object({
+const oidcClientShape = {
   audiences: z
     .array(webUrl)
     .default([])
     .transform((values) => [...new Set(values)]),
   clientId,
-  clientSecret: z.string().min(32),
   name: z.string().trim().min(1).max(128),
-  redirectUris: z.array(webUrl).min(1),
+  redirectUris: z.array(redirectUrl).min(1),
   requireHandle: z.boolean().default(false),
+};
+
+const confidentialOidcClientSchema = z.strictObject({
+  ...oidcClientShape,
+  clientSecret: z.string().min(32),
+  origins: z.never().optional(),
+  type: z.literal("confidential"),
 });
+
+const publicBrowserOidcClientSchema = z
+  .strictObject({
+    ...oidcClientShape,
+    clientSecret: z.never().optional(),
+    origins: z
+      .array(origin)
+      .min(1)
+      .superRefine((values, context) => {
+        if (new Set(values).size !== values.length) {
+          context.addIssue({
+            code: "custom",
+            message: "Duplicate browser origins are not allowed",
+          });
+        }
+      }),
+    type: z.literal("public-browser"),
+  })
+  .superRefine((client, context) => {
+    const origins = new Set(client.origins);
+    for (const redirectUri of client.redirectUris) {
+      if (!origins.has(new URL(redirectUri).origin)) {
+        context.addIssue({
+          code: "custom",
+          message: `Redirect origin is not registered: ${new URL(redirectUri).origin}`,
+          path: ["redirectUris"],
+        });
+      }
+    }
+  });
+
+const oidcClientSchema = z.discriminatedUnion("type", [
+  confidentialOidcClientSchema,
+  publicBrowserOidcClientSchema,
+]);
 
 function jsonEnv<T extends z.ZodType>(
   schema: T,
@@ -148,7 +204,7 @@ export function loadConfig(
       (client) => client.clientId === appClient.id,
     );
     if (
-      oidcClient !== undefined &&
+      oidcClient?.type === "confidential" &&
       oidcClient.clientSecret === appClient.secret
     ) {
       throw new Error(

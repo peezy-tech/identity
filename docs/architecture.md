@@ -54,6 +54,21 @@ request a registered resource audience; those JWT access tokens are
 audience-bound and verified through the issuer's JWKS. OIDC user-info flows may
 use provider-managed opaque access tokens instead.
 
+Configured `public-browser` clients use the same authorization-code flow with
+mandatory PKCE-S256, but have no client secret. They are for low-authority
+browser presentation such as a handle, display name, or avatar. A browser-held
+ID or access token does not authorize moderation, purchases, private data,
+durable ownership, multiplayer simulation, or transaction signing. A product
+that needs those capabilities must validate an audience-bound access token at
+its own server boundary or create a product session there. Products bind users
+by `(issuer, sub)`; `preferred_username`, name, picture, and email remain mutable
+attributes rather than authentication keys.
+
+Public-browser origins are a separate allowlist from application and operator
+origins. They receive non-credentialed CORS only on OIDC discovery, token,
+user-info, and JWKS endpoints. They do not become trusted origins for Identity
+sessions, account management, wallet grants, or proof flows.
+
 Tokens stay small and contain only stable or short-lived claims. Linked wallets,
 social providers, and email attributes are fetched from the identity API when
 current state is required.

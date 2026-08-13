@@ -67,6 +67,13 @@ type AppDependencies = {
 
 type IdentityConfigSocialProvider = keyof IdentityConfig["socialProviders"];
 
+const PUBLIC_OIDC_BROWSER_PATHS = new Set([
+  "/api/auth/.well-known/openid-configuration",
+  "/api/auth/jwks",
+  "/api/auth/oauth2/token",
+  "/api/auth/oauth2/userinfo",
+]);
+
 const IdentityProfileUpdateSchema = z
   .object({
     displayName: z.string().trim().min(1).max(128),
@@ -81,6 +88,18 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     dependencies.config.baseUrl,
     ...dependencies.config.trustedOrigins,
   ]);
+  const publicOidcOrigins = new Set(
+    dependencies.config.oidcClients.flatMap((client) =>
+      client.type === "public-browser" ? client.origins : [],
+    ),
+  );
+  const applyPublicOidcCors = cors({
+    allowHeaders: ["Authorization", "Content-Type"],
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    maxAge: 600,
+    origin: (requestOrigin) =>
+      publicOidcOrigins.has(requestOrigin) ? requestOrigin : "",
+  });
 
   app.use("*", async (context, next) => {
     await applySecureHeaders(context, next);
@@ -111,6 +130,11 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
       onError: (context) =>
         errorResponse(context, 413, "Request body is too large"),
     }),
+  );
+  app.use("/api/auth/*", (context, next) =>
+    PUBLIC_OIDC_BROWSER_PATHS.has(context.req.path)
+      ? applyPublicOidcCors(context, next)
+      : next(),
   );
   app.use(
     "/v1/*",

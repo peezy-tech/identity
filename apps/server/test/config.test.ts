@@ -23,6 +23,20 @@ const oidcClient = {
   name: "PledgeCash",
   redirectUris: ["https://api.pledge.cash/auth/oauth2/callback/peezy"],
   requireHandle: true,
+  type: "confidential" as const,
+};
+
+const publicBrowserClient = {
+  audiences: [],
+  clientId: "public-stream-theater",
+  name: "Public Stream Theater",
+  origins: ["https://stream-theater.tmp.peezy.tech", "http://localhost:5173"],
+  redirectUris: [
+    "https://stream-theater.tmp.peezy.tech/auth/callback",
+    "http://localhost:5173/auth/callback",
+  ],
+  requireHandle: false,
+  type: "public-browser" as const,
 };
 
 describe("Identity config", () => {
@@ -61,6 +75,106 @@ describe("Identity config", () => {
       "https://admin.peezy.tech",
       "https://pledge.cash",
     ]);
+  });
+
+  test("parses a public browser client without broadening trusted origins", () => {
+    const config = loadConfig({
+      ...baseEnv,
+      IDENTITY_OIDC_CLIENTS: JSON.stringify([publicBrowserClient]),
+    });
+
+    expect(config.oidcClients[0]).toEqual(publicBrowserClient);
+    expect(config.trustedOrigins).toEqual([]);
+  });
+
+  test("requires an explicit client type and the matching secret policy", () => {
+    const { clientSecret: _, ...withoutTypeOrSecret } = oidcClient;
+
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        IDENTITY_OIDC_CLIENTS: JSON.stringify([withoutTypeOrSecret]),
+      }),
+    ).toThrow();
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        IDENTITY_OIDC_CLIENTS: JSON.stringify([
+          { ...withoutTypeOrSecret, type: "confidential" },
+        ]),
+      }),
+    ).toThrow();
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        IDENTITY_OIDC_CLIENTS: JSON.stringify([
+          { ...publicBrowserClient, clientSecret: oidcClient.clientSecret },
+        ]),
+      }),
+    ).toThrow();
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        IDENTITY_OIDC_CLIENTS: JSON.stringify([
+          { ...publicBrowserClient, origins: [] },
+        ]),
+      }),
+    ).toThrow();
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        IDENTITY_OIDC_CLIENTS: JSON.stringify([
+          { ...oidcClient, origins: ["https://pledge.cash"] },
+        ]),
+      }),
+    ).toThrow();
+  });
+
+  test("validates and normalizes exact public browser origins", () => {
+    const parseOrigins = (
+      origins: string[],
+      redirectUris = ["https://stream-theater.tmp.peezy.tech/auth/callback"],
+    ) =>
+      loadConfig({
+        ...baseEnv,
+        IDENTITY_OIDC_CLIENTS: JSON.stringify([
+          { ...publicBrowserClient, origins, redirectUris },
+        ]),
+      });
+
+    expect(() =>
+      parseOrigins(["https://stream-theater.tmp.peezy.tech/app"]),
+    ).toThrow("Expected an origin without a path, query, or fragment");
+    expect(() =>
+      parseOrigins(["https://user:pass@stream-theater.tmp.peezy.tech"]),
+    ).toThrow("Expected HTTPS or a loopback HTTP URL without credentials");
+    expect(() => parseOrigins(["https://*.tmp.peezy.tech"])).toThrow(
+      "Wildcard hosts are not allowed",
+    );
+    expect(() =>
+      parseOrigins(["http://stream-theater.tmp.peezy.tech"]),
+    ).toThrow("Expected HTTPS or a loopback HTTP URL without credentials");
+    expect(() =>
+      parseOrigins([
+        "https://stream-theater.tmp.peezy.tech",
+        "https://stream-theater.tmp.peezy.tech:443",
+      ]),
+    ).toThrow("Duplicate browser origins are not allowed");
+    expect(() =>
+      parseOrigins(
+        ["https://another.tmp.peezy.tech"],
+        ["https://stream-theater.tmp.peezy.tech/auth/callback"],
+      ),
+    ).toThrow(
+      "Redirect origin is not registered: https://stream-theater.tmp.peezy.tech",
+    );
+
+    expect(
+      parseOrigins(
+        ["http://127.0.0.1:5173"],
+        ["http://127.0.0.1:5173/auth/callback"],
+      ).oidcClients[0],
+    ).toMatchObject({ origins: ["http://127.0.0.1:5173"] });
   });
 
   test("accepts only explicit trusted proxy addresses and CIDR ranges", () => {
@@ -116,5 +230,14 @@ describe("Identity config", () => {
         ]),
       }),
     ).toThrow();
+  });
+
+  test("rejects duplicate OIDC client IDs", () => {
+    expect(() =>
+      loadConfig({
+        ...baseEnv,
+        IDENTITY_OIDC_CLIENTS: JSON.stringify([oidcClient, oidcClient]),
+      }),
+    ).toThrow("Duplicate configured identity: pledge-cash");
   });
 });
