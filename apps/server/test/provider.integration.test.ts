@@ -636,8 +636,12 @@ if (databaseUrl === undefined) {
 
       const firstClaim = await claim(firstSignIn.cookie);
       expect(firstClaim.status).toBe(201);
-      const firstBody = (await firstClaim.json()) as { identities: unknown[] };
+      const firstBody = (await firstClaim.json()) as {
+        identities: unknown[];
+        privyUserId: string;
+      };
       expect(firstBody.identities).toHaveLength(5);
+      expect(firstBody.privyUserId).toBe("did:privy:legacy-person");
       expect((await claim(firstSignIn.cookie)).status).toBe(201);
       const claimedElsewhere = await claim(secondSignIn.cookie);
       expect(claimedElsewhere.status).toBe(409);
@@ -1308,7 +1312,12 @@ if (databaseUrl === undefined) {
         },
       );
       expect(await claimsResponse.json()).toMatchObject({
-        claims: [{ identities: [{ disposition: "linked" }] }],
+        claims: [
+          {
+            identities: [{ disposition: "linked" }],
+            privyUserId: "did:privy:legacy-wallet-person",
+          },
+        ],
       });
       expect(
         await database.db

@@ -54,6 +54,7 @@ type Claim = {
   claimedAt: string;
   id: string;
   identities: MigrationIdentity[];
+  privyUserId: string;
   privyUserHint: string;
 };
 type MergePreview = {
@@ -153,7 +154,6 @@ function AccountApp() {
   }
 
   async function refreshClaims() {
-    if (!config.privyAppId) return;
     try {
       const nextClaims = await requestJson<{ claims: Claim[] }>(
         "/v1/migrations/privy/claims/current",
@@ -821,7 +821,28 @@ function PrivyMigrationPanel(props: {
   showError(error: unknown): void;
 }) {
   if (!config.privyAppId) {
-    return <p className="muted">Lobby import is currently unavailable.</p>;
+    return (
+      <>
+        <PrivyClaimList busy={props.busy} claims={props.claims} />
+        <p className="muted">
+          {props.claims.length > 0
+            ? "New Lobby imports are currently unavailable."
+            : "Lobby import is currently unavailable."}
+        </p>
+        {props.claimsError ? (
+          <div className="migration-unavailable" role="status">
+            <strong>Imported Lobby history could not be loaded.</strong>
+            <p>{props.claimsError}</p>
+            <button
+              className="quiet"
+              onClick={() => props.refreshClaims().catch(props.showError)}
+            >
+              Retry Lobby history
+            </button>
+          </div>
+        ) : null}
+      </>
+    );
   }
   return (
     <MigrationBoundary>
@@ -984,11 +1005,32 @@ function PrivyMigration(props: {
       >
         Continue with Privy to import <span>↗</span>
       </button>
+      <PrivyClaimList
+        busy={props.busy}
+        claims={props.claims}
+        verifyIdentity={verifyIdentity}
+        walletAddresses={walletAddresses}
+      />
+    </div>
+  );
+}
+
+function PrivyClaimList(props: {
+  busy: string | null;
+  claims: Claim[];
+  verifyIdentity?(item: MigrationIdentity): void;
+  walletAddresses?: ReadonlySet<string>;
+}) {
+  return (
+    <>
       {props.claims.map((claim) => (
         <div className="claim" key={claim.id}>
           <div className="claim-head">
-            <strong>Privy {claim.privyUserHint}</strong>
-            <time>{new Date(claim.claimedAt).toLocaleDateString()}</time>
+            <div>
+              <strong>Privy user ID</strong>
+              <code>{claim.privyUserId}</code>
+            </div>
+            <time>Linked {new Date(claim.claimedAt).toLocaleDateString()}</time>
           </div>
           {claim.identities.map((item) => (
             <div className="migration-row" key={item.id}>
@@ -1001,14 +1043,15 @@ function PrivyMigration(props: {
                   {item.disposition.replaceAll("_", " ")}
                 </span>
                 {item.disposition === "needs_reverification" &&
-                (item.provider || item.walletAddress) ? (
+                (item.provider || item.walletAddress) &&
+                props.verifyIdentity !== undefined ? (
                   <button
                     className="text-button"
                     disabled={props.busy !== null}
-                    onClick={() => verifyIdentity(item)}
+                    onClick={() => props.verifyIdentity?.(item)}
                   >
                     {item.walletAddress &&
-                    walletAddresses.has(
+                    props.walletAddresses?.has(
                       item.chainType === "solana"
                         ? `solana:${item.walletAddress}`
                         : `evm:${item.walletAddress.toLowerCase()}`,
@@ -1022,7 +1065,7 @@ function PrivyMigration(props: {
           ))}
         </div>
       ))}
-    </div>
+    </>
   );
 }
 
@@ -1066,7 +1109,9 @@ const styles = `
   .primary-action:disabled,button:disabled{opacity:.48;cursor:not-allowed}
   .claim{margin-top:2rem}
   .claim-head,.migration-row{display:flex;justify-content:space-between;align-items:center;gap:1rem;border-top:1px solid #272b28;padding:1rem 0}
-  .claim-head time{color:#747a74;font-size:.8rem}
+  .claim-head>div{display:flex;min-width:0;flex-direction:column;gap:.3rem}
+  .claim-head code{color:#c8cec8;font-size:.76rem;overflow-wrap:anywhere}
+  .claim-head time{color:#747a74;font-size:.8rem;white-space:nowrap}
   .migration-row>div:first-child{display:flex;flex-direction:column;gap:.25rem}
   .disposition{display:flex;align-items:center;gap:1rem;text-align:right}
   .disposition>[data-state]{color:#aab0aa}
@@ -1087,7 +1132,7 @@ const styles = `
     .section-intro{grid-template-columns:2rem 1fr}
     .field-row,.profile-metadata{grid-template-columns:1fr}
     .field-row .save,.sign-out,.button-row .quiet,.button-row .danger{width:100%}
-    .migration-row{align-items:flex-start;flex-direction:column}
+    .claim-head,.migration-row{align-items:flex-start;flex-direction:column}
     .disposition{width:100%;justify-content:space-between;text-align:left}
   }
 `;
