@@ -18,8 +18,6 @@
     "@better-auth/oauth-provider": "1.7.0-rc.1",
     "@peezy.tech/identity": "workspace:*",
     "@peezy.tech/identity-server": "workspace:*",
-    "@privy-io/node": "0.28.0",
-    "@privy-io/react-auth": "3.37.0",
     "@solana-program/memo": "0.10.0",
     "@solana-program/system": "0.10.0",
     "@solana-program/token": "0.9.0",

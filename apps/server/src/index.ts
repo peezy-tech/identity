@@ -7,7 +7,6 @@ import { createIdentityAuth, createIdentityProofAuth } from "./auth";
 import { seedConfiguredClients } from "./clients";
 import { loadConfig } from "./config";
 import { createDbClient } from "./db/client";
-import { createPrivyGateway } from "./privy-migration";
 
 const config = loadConfig();
 const database = createDbClient(config.databaseUrl);
@@ -23,9 +22,6 @@ const app = createIdentityApp({
   auth,
   config,
   db,
-  ...(config.privyMigration === undefined
-    ? {}
-    : { privyGateway: createPrivyGateway(config.privyMigration) }),
   proofAuth,
   socialProviderNames,
 });

@@ -1,38 +1,14 @@
-import {
-  getAccessToken,
-  PrivyProvider,
-  useLogin,
-  usePrivy,
-  useWallets,
-} from "@privy-io/react-auth";
-import {
-  toSolanaWalletConnectors,
-  useWallets as useSolanaWallets,
-} from "@privy-io/react-auth/solana";
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 
 import {
   isSignInCredential,
   linkedSocialProviders,
 } from "./account-client-credentials";
-import {
-  clearPendingPrivyMigrationAttempt,
-  type PendingPrivyMigrationAttempt,
-  readPendingPrivyMigrationAttempt,
-  type PrivyAttemptStorage,
-  writePendingPrivyMigrationAttempt,
-} from "./account-client-privy";
 import { selectEthereumAccount } from "./account-client-wallet";
 
 type Provider = "apple" | "discord" | "github" | "telegram" | "twitter";
-type AccountConfig = { privyAppId: string | null; providers: Provider[] };
+type AccountConfig = { providers: Provider[] };
 type Credential = {
   address?: string;
   family?: "evm" | "solana";
@@ -52,27 +28,6 @@ type Identity = {
     id: string;
     primaryEmail?: { value: string; verified: boolean };
   };
-};
-type MigrationIdentity = {
-  chainType?: string;
-  displayHint: string;
-  disposition:
-    | "already_linked"
-    | "needs_reverification"
-    | "legacy_only"
-    | "conflict"
-    | "linked";
-  id: string;
-  provider?: Provider;
-  type: string;
-  walletAddress?: string;
-};
-type Claim = {
-  claimedAt: string;
-  id: string;
-  identities: MigrationIdentity[];
-  privyUserId: string;
-  privyUserHint: string;
 };
 type MergePreview = {
   attemptId: string;
@@ -149,8 +104,6 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 function AccountApp() {
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [identityError, setIdentityError] = useState<string | null>(null);
-  const [claims, setClaims] = useState<Claim[]>([]);
-  const [claimsError, setClaimsError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string>("");
   const [mergePreview, setMergePreview] = useState<MergePreview | null>(null);
@@ -170,26 +123,12 @@ function AccountApp() {
     }
   }
 
-  async function refreshClaims() {
-    try {
-      const nextClaims = await requestJson<{ claims: Claim[] }>(
-        "/v1/migrations/privy/claims/current",
-      );
-      setClaims(nextClaims.claims);
-      setClaimsError(null);
-    } catch (error) {
-      setClaimsError(errorMessage(error));
-    }
-  }
-
   async function refresh() {
     await refreshIdentity();
-    await refreshClaims();
   }
 
   useEffect(() => {
     refreshIdentity().catch(() => undefined);
-    refreshClaims().catch(() => undefined);
     if (new URLSearchParams(location.search).get("merge") === "proof") {
       setBusy("merge-proof");
       requestJson<MergePreview>("/v1/account-merges/proofs", {
@@ -283,23 +222,16 @@ function AccountApp() {
     );
   }
 
-  async function linkWallet(
-    addressHint?: string,
-    selectedProvider?: EthereumProvider,
-  ) {
-    const walletProvider = selectedProvider ?? ethereum();
+  async function linkWallet() {
+    const walletProvider = ethereum();
     if (!walletProvider)
       throw new Error("No EVM wallet was detected in this browser");
     const accounts = (await walletProvider.request({
       method: "eth_requestAccounts",
     })) as string[];
-    const address = selectEthereumAccount(accounts, addressHint);
+    const address = selectEthereumAccount(accounts);
     if (!address) {
-      throw new Error(
-        addressHint === undefined
-          ? "No wallet account was selected"
-          : "Select the wallet attached to this Privy identity",
-      );
+      throw new Error("No wallet account was selected");
     }
     const chainHex = (await walletProvider.request({
       method: "eth_chainId",
@@ -323,16 +255,8 @@ function AccountApp() {
     setNotice("Wallet verified and linked.");
   }
 
-  async function linkSolanaWallet(
-    addressHint?: string,
-    selectedWallet?: SolanaSigner,
-  ) {
-    const wallet = selectedWallet ?? (await injectedSolanaSigner());
-    if (addressHint !== undefined && wallet.address !== addressHint) {
-      throw new Error(
-        "Select the Solana wallet attached to this Privy identity",
-      );
-    }
+  async function linkSolanaWallet() {
+    const wallet = await injectedSolanaSigner();
     const challenge = await requestJson<{
       challengeId: string;
       message: string;
@@ -352,16 +276,6 @@ function AccountApp() {
     });
     await refresh();
     setNotice("Solana wallet verified and linked.");
-  }
-
-  function reverify(item: MigrationIdentity) {
-    setNotice("");
-    if (item.provider) {
-      const callback = `${location.origin}/account`;
-      location.assign(
-        `/link-social?provider=${item.provider}&callback_url=${encodeURIComponent(callback)}`,
-      );
-    }
   }
 
   function proveSocial(provider: Provider) {
@@ -683,38 +597,12 @@ function AccountApp() {
         </div>
       </section>
 
-      <section className="ledger" aria-labelledby="legacy-account">
-        <div className="section-intro">
-          <span>03</span>
-          <div>
-            <h2 id="legacy-account">Import an old Lobby profile</h2>
-            <p>
-              This optional step uses Privy only to find and import identities
-              from the retired Lobby account system. Privy is not your
-              peezy.tech sign-in.
-            </p>
-          </div>
-        </div>
-        <PrivyMigrationPanel
-          busy={busy}
-          claims={claims}
-          claimsError={claimsError}
-          linkSolanaWallet={linkSolanaWallet}
-          linkWallet={linkWallet}
-          refreshClaims={refreshClaims}
-          reverify={reverify}
-          setBusy={setBusy}
-          setNotice={setNotice}
-          showError={showError}
-        />
-      </section>
-
       <section
         className="ledger danger-zone"
         aria-labelledby="consolidate-account"
       >
         <div className="section-intro">
-          <span>04</span>
+          <span>03</span>
           <div>
             <h2 id="consolidate-account">Consolidate accounts</h2>
             <p>
@@ -798,396 +686,6 @@ function AccountApp() {
   );
 }
 
-class MigrationBoundary extends React.Component<
-  { children: React.ReactNode },
-  { failed: boolean }
-> {
-  override state = { failed: false };
-
-  static getDerivedStateFromError() {
-    return { failed: true };
-  }
-
-  override render() {
-    if (this.state.failed) {
-      return (
-        <div className="migration-unavailable" role="status">
-          <strong>Lobby import is temporarily unavailable.</strong>
-          <p>Your peezy.tech account and sign-in methods are unaffected.</p>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
-
-function PrivyMigrationPanel(props: {
-  busy: string | null;
-  claims: Claim[];
-  claimsError: string | null;
-  refreshClaims(): Promise<void>;
-  reverify(item: MigrationIdentity): void;
-  linkWallet(addressHint?: string, provider?: EthereumProvider): Promise<void>;
-  linkSolanaWallet(addressHint?: string, wallet?: SolanaSigner): Promise<void>;
-  setBusy(value: string | null): void;
-  setNotice(value: string): void;
-  showError(error: unknown): void;
-}) {
-  if (!config.privyAppId) {
-    return (
-      <>
-        {props.claims.length > 0 ? <PrivyLinkedHeader /> : null}
-        <PrivyClaimList busy={props.busy} claims={props.claims} />
-        <p className="muted">
-          {props.claims.length > 0
-            ? "New Lobby imports are currently unavailable."
-            : "Lobby import is currently unavailable."}
-        </p>
-        {props.claimsError ? (
-          <div className="migration-unavailable" role="status">
-            <strong>Imported Lobby history could not be loaded.</strong>
-            <p>{props.claimsError}</p>
-            <button
-              className="quiet"
-              onClick={() => props.refreshClaims().catch(props.showError)}
-            >
-              Retry Lobby history
-            </button>
-          </div>
-        ) : null}
-      </>
-    );
-  }
-  return (
-    <MigrationBoundary>
-      <PrivyProvider
-        appId={config.privyAppId}
-        config={{
-          appearance: {
-            theme: "dark",
-            accentColor: "#B9F27C",
-            walletChainType: "ethereum-and-solana",
-          },
-          externalWallets: { solana: { connectors: solanaConnectors } },
-        }}
-      >
-        <PrivyMigration
-          busy={props.busy}
-          claims={props.claims}
-          linkSolanaWallet={props.linkSolanaWallet}
-          linkWallet={props.linkWallet}
-          refreshClaims={props.refreshClaims}
-          reverify={props.reverify}
-          setBusy={props.setBusy}
-          setNotice={props.setNotice}
-          showError={props.showError}
-        />
-        {props.claimsError ? (
-          <div className="migration-unavailable" role="status">
-            <strong>Imported Lobby history could not be loaded.</strong>
-            <p>{props.claimsError}</p>
-            <button
-              className="quiet"
-              onClick={() => props.refreshClaims().catch(props.showError)}
-            >
-              Retry Lobby history
-            </button>
-          </div>
-        ) : null}
-      </PrivyProvider>
-    </MigrationBoundary>
-  );
-}
-
-function PrivyMigration(props: {
-  busy: string | null;
-  claims: Claim[];
-  refreshClaims(): Promise<void>;
-  reverify(item: MigrationIdentity): void;
-  linkWallet(addressHint?: string, provider?: EthereumProvider): Promise<void>;
-  linkSolanaWallet(addressHint?: string, wallet?: SolanaSigner): Promise<void>;
-  setBusy(value: string | null): void;
-  setNotice(value: string): void;
-  showError(error: unknown): void;
-}) {
-  const {
-    authenticated,
-    getAccessToken: hookGetAccessToken,
-    logout,
-    ready,
-  } = usePrivy();
-  const { wallets } = useWallets();
-  const { wallets: solanaWallets } = useSolanaWallets();
-  const storage = useMemo<PrivyAttemptStorage | null>(() => {
-    try {
-      return window.sessionStorage;
-    } catch {
-      return null;
-    }
-  }, []);
-  const [attempt, setAttempt] = useState<PendingPrivyMigrationAttempt | null>(
-    () => readPendingPrivyMigrationAttempt(storage),
-  );
-  const attemptRef = useRef(attempt);
-  const claimInFlightRef = useRef(false);
-  const lastSubmittedAttemptIdRef = useRef<string | null>(null);
-  const walletAddresses = useMemo(
-    () =>
-      new Set([
-        ...wallets.map((wallet) => `evm:${wallet.address.toLowerCase()}`),
-        ...solanaWallets.map((wallet) => `solana:${wallet.address}`),
-      ]),
-    [solanaWallets, wallets],
-  );
-
-  const rememberAttempt = useCallback(
-    (next: PendingPrivyMigrationAttempt | null) => {
-      attemptRef.current = next;
-      setAttempt(next);
-      if (next === null) {
-        clearPendingPrivyMigrationAttempt(storage);
-      } else {
-        writePendingPrivyMigrationAttempt(storage, next);
-      }
-    },
-    [storage],
-  );
-
-  const submitPendingClaim = useCallback(async () => {
-    const pending = attemptRef.current;
-    if (
-      pending === null ||
-      claimInFlightRef.current ||
-      lastSubmittedAttemptIdRef.current === pending.attemptId
-    ) {
-      return;
-    }
-    if (Date.parse(pending.expiresAt) <= Date.now()) {
-      rememberAttempt(null);
-      props.setNotice("Privy import expired. Start again to continue.");
-      return;
-    }
-    claimInFlightRef.current = true;
-    lastSubmittedAttemptIdRef.current = pending.attemptId;
-    props.setBusy("privy-claim");
-    try {
-      const token = (await hookGetAccessToken()) ?? (await getAccessToken());
-      if (!token) throw new Error("Privy did not return an access token");
-      await requestJson("/v1/migrations/privy/claims", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-        body: JSON.stringify(pending),
-      });
-      rememberAttempt(null);
-      await props.refreshClaims();
-      props.setNotice(
-        "Lobby profile linked. Your Privy user ID is shown below.",
-      );
-    } catch (error) {
-      const code = (error as { code?: string }).code;
-      if (
-        code === "invalid_attempt" ||
-        code === "invalid_request" ||
-        code === "claimed_elsewhere"
-      ) {
-        rememberAttempt(null);
-      }
-      props.showError(error);
-    } finally {
-      claimInFlightRef.current = false;
-      props.setBusy(null);
-    }
-  }, [hookGetAccessToken, props, rememberAttempt]);
-
-  const { login } = useLogin({
-    onComplete: () => {
-      lastSubmittedAttemptIdRef.current = null;
-      void submitPendingClaim();
-    },
-    onError: (error) => {
-      props.setBusy(null);
-      props.showError(new Error(`Privy login failed (${error})`));
-    },
-  });
-
-  useEffect(() => {
-    if (!ready || !authenticated || !attempt) return;
-    void submitPendingClaim();
-  }, [authenticated, attempt, ready, submitPendingClaim]);
-
-  async function start() {
-    props.setBusy("privy-login");
-    props.setNotice("");
-    try {
-      if (attemptRef.current === null) {
-        const next = await requestJson<PendingPrivyMigrationAttempt>(
-          "/v1/migrations/privy/attempts",
-          { method: "POST", body: "{}" },
-        );
-        if (authenticated) await logout();
-        rememberAttempt(next);
-      }
-      lastSubmittedAttemptIdRef.current = null;
-      login();
-    } catch (error) {
-      props.showError(error);
-    } finally {
-      if (!claimInFlightRef.current) props.setBusy(null);
-    }
-  }
-
-  function verifyIdentity(item: MigrationIdentity) {
-    if (item.provider) {
-      props.reverify(item);
-      return;
-    }
-    if (!item.walletAddress) return;
-    if (item.type === "smart_wallet") {
-      props.showError(
-        new Error(
-          "Privy smart-wallet migration requires a chain-scoped proof and is not available yet",
-        ),
-      );
-      return;
-    }
-    props.setBusy(item.id);
-    if (item.chainType === "solana") {
-      const privyWallet = solanaWallets.find(
-        (wallet) => wallet.address === item.walletAddress,
-      );
-      props
-        .linkSolanaWallet(item.walletAddress, privyWallet)
-        .catch(props.showError)
-        .finally(() => props.setBusy(null));
-      return;
-    }
-    const privyWallet = wallets.find(
-      (wallet) =>
-        wallet.address.toLowerCase() === item.walletAddress?.toLowerCase(),
-    );
-    if (privyWallet === undefined) {
-      props.showError(
-        new Error("Connect the Privy wallet attached to this identity"),
-      );
-      props.setBusy(null);
-      return;
-    }
-    (async () => {
-      const provider =
-        (await privyWallet.getEthereumProvider()) as EthereumProvider;
-      await props.linkWallet(item.walletAddress, provider);
-    })()
-      .catch(props.showError)
-      .finally(() => props.setBusy(null));
-  }
-
-  return (
-    <div>
-      {props.claims.length === 0 ? (
-        <>
-          <button
-            className="primary-action"
-            disabled={!ready || props.busy !== null}
-            onClick={start}
-          >
-            {attempt ? "Resume Privy import" : "Continue with Privy to import"}{" "}
-            <span>↗</span>
-          </button>
-          {attempt ? (
-            <p className="migration-pending" role="status">
-              Your Privy sign-in is pending. Continue to finish linking this
-              Lobby profile.
-            </p>
-          ) : null}
-        </>
-      ) : (
-        <>
-          <PrivyLinkedHeader />
-          <PrivyClaimList
-            busy={props.busy}
-            claims={props.claims}
-            verifyIdentity={verifyIdentity}
-            walletAddresses={walletAddresses}
-          />
-          <button
-            className="quiet migration-secondary"
-            disabled={!ready || props.busy !== null}
-            onClick={start}
-          >
-            Refresh or import another Privy profile
-          </button>
-        </>
-      )}
-    </div>
-  );
-}
-
-function PrivyLinkedHeader() {
-  return (
-    <div className="migration-linked" role="status">
-      <span>Linked</span>
-      <div>
-        <strong>Lobby profile imported</strong>
-        <p>Your Privy account is linked to this peezy.tech identity.</p>
-      </div>
-    </div>
-  );
-}
-
-function PrivyClaimList(props: {
-  busy: string | null;
-  claims: Claim[];
-  verifyIdentity?(item: MigrationIdentity): void;
-  walletAddresses?: ReadonlySet<string>;
-}) {
-  return (
-    <>
-      {props.claims.map((claim) => (
-        <div className="claim" key={claim.id}>
-          <div className="claim-head">
-            <div>
-              <strong>Privy user ID</strong>
-              <code>{claim.privyUserId}</code>
-            </div>
-            <time>Linked {new Date(claim.claimedAt).toLocaleDateString()}</time>
-          </div>
-          {claim.identities.map((item) => (
-            <div className="migration-row" key={item.id}>
-              <div>
-                <strong>{item.displayHint}</strong>
-                <span>{item.type.replaceAll("_", " ")}</span>
-              </div>
-              <div className="disposition">
-                <span data-state={item.disposition}>
-                  {item.disposition.replaceAll("_", " ")}
-                </span>
-                {item.disposition === "needs_reverification" &&
-                (item.provider || item.walletAddress) &&
-                props.verifyIdentity !== undefined ? (
-                  <button
-                    className="text-button"
-                    disabled={props.busy !== null}
-                    onClick={() => props.verifyIdentity?.(item)}
-                  >
-                    {item.walletAddress &&
-                    props.walletAddresses?.has(
-                      item.chainType === "solana"
-                        ? `solana:${item.walletAddress}`
-                        : `evm:${item.walletAddress.toLowerCase()}`,
-                    )
-                      ? "Sign with Privy wallet"
-                      : "Verify"}
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          ))}
-        </div>
-      ))}
-    </>
-  );
-}
-
 const styles = `
   .ledger{border-top:1px solid #2b2f2c;padding:2.4rem 0 3.6rem}
   .section-intro{display:grid;grid-template-columns:3rem 1fr;gap:1rem;align-items:start}
@@ -1195,9 +693,9 @@ const styles = `
   .section-intro h2{font-size:clamp(1.55rem,3vw,2.35rem);letter-spacing:-.045em;margin:-.25rem 0 .4rem}
   .section-intro p,.muted{color:#969c96;line-height:1.55;margin:0}
   .account-loading{color:#b9f27c;padding:3rem 0}
-  .account-error,.migration-unavailable{border:1px solid #4c403b;background:#1d1b19;padding:1.25rem;margin:1.5rem 0}
-  .account-error strong,.migration-unavailable strong{font-size:1.05rem}
-  .account-error p,.migration-unavailable p{color:#aaa49e;line-height:1.5;margin:.45rem 0 0}
+  .account-error{border:1px solid #4c403b;background:#1d1b19;padding:1.25rem;margin:1.5rem 0}
+  .account-error strong{font-size:1.05rem}
+  .account-error p{color:#aaa49e;line-height:1.5;margin:.45rem 0 0}
   .account-summary{display:flex;align-items:center;gap:1rem;margin:2rem 0 1.5rem}
   .account-summary>div:last-child{display:flex;flex-direction:column;gap:.24rem}
   .account-summary strong{font-size:1.2rem;overflow-wrap:anywhere}
@@ -1215,7 +713,7 @@ const styles = `
   .sign-out{border:1px solid #4a4f4a;background:transparent;color:#f5f4ef;margin-top:1.4rem}
   .profile-metadata{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem;margin-top:1.25rem}
   .profile-metadata>div{display:flex;min-width:0;flex-direction:column;gap:.25rem;border-top:1px solid #272b28;padding-top:.85rem}
-  .profile-metadata span,.credential>span,.migration-row span{color:#858b85;font-size:.72rem;text-transform:uppercase;letter-spacing:.09em}
+  .profile-metadata span,.credential>span{color:#858b85;font-size:.72rem;text-transform:uppercase;letter-spacing:.09em}
   .profile-metadata strong,.profile-metadata code,.credential strong{overflow-wrap:anywhere}
   .profile-metadata code{color:#c8cec8;font-size:.76rem}
   .profile-metadata small,.credential small{color:#747a74;line-height:1.4}
@@ -1223,32 +721,13 @@ const styles = `
   .credential{display:flex;flex-direction:column;gap:.35rem;padding:1rem 1rem 1rem 0;border-top:1px solid #272b28}
   .credential-empty{color:#969c96;margin:0;padding:1rem 0;border-top:1px solid #272b28}
   .add-methods{margin-top:1.7rem}
-  .primary-action{width:100%;min-height:3.25rem;display:flex;justify-content:space-between;align-items:center;margin-top:2rem;padding:1rem 1.2rem;border:0;border-radius:.25rem;background:#b9f27c;color:#11150f;font-weight:790;cursor:pointer}
-  .primary-action:hover,.save:hover{background:#c8ff8b}
-  .primary-action:disabled,button:disabled{opacity:.48;cursor:not-allowed}
-  .migration-pending{color:#aeb2ac;line-height:1.5;margin:.8rem 0 0}
-  .migration-linked{display:flex;align-items:flex-start;gap:1rem;margin-top:2rem;padding:1rem 0;border-top:1px solid #394038;border-bottom:1px solid #272b28}
-  .migration-linked>span{flex:0 0 auto;border:1px solid #54733c;border-radius:999px;background:#182414;color:#b9f27c;padding:.3rem .55rem;font-size:.68rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase}
-  .migration-linked>div{display:flex;flex-direction:column;gap:.3rem}
-  .migration-linked strong{font-size:1.05rem}
-  .migration-linked p{color:#969c96;line-height:1.5;margin:0}
-  .migration-secondary{margin-top:1rem}
-  .claim{margin-top:2rem}
-  .claim-head,.migration-row{display:flex;justify-content:space-between;align-items:center;gap:1rem;border-top:1px solid #272b28;padding:1rem 0}
-  .claim-head>div{display:flex;min-width:0;flex-direction:column;gap:.3rem}
-  .claim-head code{color:#c8cec8;font-size:.76rem;overflow-wrap:anywhere}
-  .claim-head time{color:#747a74;font-size:.8rem;white-space:nowrap}
-  .migration-row>div:first-child{display:flex;flex-direction:column;gap:.25rem}
-  .disposition{display:flex;align-items:center;gap:1rem;text-align:right}
-  .disposition>[data-state]{color:#aab0aa}
-  .disposition>[data-state=linked],.disposition>[data-state=already_linked]{color:#b9f27c}
-  .disposition>[data-state=conflict]{color:#ff9a84}
+  .save:hover{background:#c8ff8b}
+  button:disabled{opacity:.48;cursor:not-allowed}
   .button-row{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1.2rem}
-  .quiet,.danger,.text-button{min-height:2.75rem;border:1px solid #393e3a;background:transparent;color:#f5f4ef;border-radius:.25rem;padding:.72rem 1rem;font:inherit;cursor:pointer;text-decoration:none}
-  .quiet:hover,.text-button:hover,.sign-out:hover{border-color:#b9f27c}
+  .quiet,.danger{min-height:2.75rem;border:1px solid #393e3a;background:transparent;color:#f5f4ef;border-radius:.25rem;padding:.72rem 1rem;font:inherit;cursor:pointer;text-decoration:none}
+  .quiet:hover,.sign-out:hover{border-color:#b9f27c}
   .link-button{display:inline-flex;align-items:center}
   .danger{background:#ff795e;border-color:#ff795e;color:#160906;font-weight:750}
-  .text-button{min-height:2.4rem;padding:.35rem .55rem;font-size:.75rem}
   .merge-preview{margin-top:1.8rem}
   .notice{margin:0 0 1rem;border:1px solid #5b4c45;border-radius:.25rem;background:#201d1a;color:#ffd0c5;padding:.8rem 1rem}
   .danger-zone{padding-bottom:1.5rem}
@@ -1258,8 +737,6 @@ const styles = `
     .section-intro{grid-template-columns:2rem 1fr}
     .field-row,.profile-metadata{grid-template-columns:1fr}
     .field-row .save,.sign-out,.button-row .quiet,.button-row .danger{width:100%}
-    .claim-head,.migration-row{align-items:flex-start;flex-direction:column}
-    .disposition{width:100%;justify-content:space-between;text-align:left}
   }
 `;
 
@@ -1290,8 +767,6 @@ function requireExactSignedMessage(requested: Uint8Array, signed?: Uint8Array) {
     throw new Error("The wallet changed the SIWS message before signing");
   }
 }
-
-const solanaConnectors = toSolanaWalletConnectors({ shouldAutoConnect: false });
 
 const root = createRoot(document.getElementById("account-root")!);
 root.render(<AccountApp />);
