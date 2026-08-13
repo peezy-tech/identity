@@ -23,6 +23,7 @@
     "format:check": "prettier --check .",
     "package:smoke": "bun scripts/package-smoke.ts",
     "test": "bun --cwd packages/identity build && bun --cwd packages/identity test && bun --cwd packages/server test && bun --cwd apps/server test",
+    "test:vendor-shamir": "bun scripts/vendor-shamir-smoke.ts",
     "typecheck": "bun --cwd packages/identity build && bun --cwd packages/identity typecheck && bun --cwd packages/server typecheck && bun --cwd apps/server typecheck && tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
