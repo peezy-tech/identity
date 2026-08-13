@@ -48,13 +48,6 @@ import {
   linkSocialPage,
   signInPage,
 } from "./pages";
-import {
-  claimPrivyMigration,
-  createPrivyMigrationAttempt,
-  listCurrentPrivyClaims,
-  PrivyMigrationError,
-  type PrivyGateway,
-} from "./privy-migration";
 import { consumeRateLimit } from "./rate-limit";
 import { createSocialLinkHandoff } from "./session-handoffs";
 import {
@@ -68,7 +61,6 @@ type AppDependencies = {
   auth: IdentityAuth;
   config: IdentityConfig;
   db: IdentityDb;
-  privyGateway?: PrivyGateway;
   proofAuth: IdentityProofAuth;
   socialProviderNames: IdentityConfigSocialProvider[];
 };
@@ -155,15 +147,7 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     }
     const nonce = crypto.randomUUID().replaceAll("-", "");
     return context.html(
-      accountPage(
-        {
-          providers: dependencies.socialProviderNames,
-          ...(dependencies.config.privyMigration === undefined
-            ? {}
-            : { privyAppId: dependencies.config.privyMigration.appId }),
-        },
-        nonce,
-      ),
+      accountPage({ providers: dependencies.socialProviderNames }, nonce),
       200,
       accountSecurityHeaders(nonce),
     );
@@ -313,99 +297,6 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
         subject: identitySession.user.id,
       }),
     );
-  });
-
-  app.post("/v1/migrations/privy/attempts", async (context) => {
-    requireSameOrigin(context.req.raw, dependencies.config.baseUrl);
-    const identitySession = await requireIdentitySession(
-      dependencies.auth,
-      context.req.raw.headers,
-    );
-    if (
-      dependencies.config.privyMigration === undefined ||
-      dependencies.privyGateway === undefined
-    ) {
-      throw new PrivyMigrationError(
-        404,
-        "migration_unavailable",
-        "Privy migration is not available",
-      );
-    }
-    await requireRateLimit(dependencies.db, {
-      key: `privy-attempt:${identitySession.user.id}`,
-      limit: 20,
-      windowMs: 5 * 60_000,
-    });
-    return context.json(
-      await createPrivyMigrationAttempt(
-        dependencies.db,
-        identitySession.user.id,
-      ),
-      201,
-    );
-  });
-
-  app.post("/v1/migrations/privy/claims", async (context) => {
-    requireSameOrigin(context.req.raw, dependencies.config.baseUrl);
-    const identitySession = await requireIdentitySession(
-      dependencies.auth,
-      context.req.raw.headers,
-    );
-    if (
-      dependencies.config.privyMigration === undefined ||
-      dependencies.privyGateway === undefined
-    ) {
-      throw new PrivyMigrationError(
-        404,
-        "migration_unavailable",
-        "Privy migration is not available",
-      );
-    }
-    const accessToken = bearerToken(context.req.raw);
-    const body = (await boundedJson(context)) as {
-      attemptId?: unknown;
-      csrfToken?: unknown;
-    };
-    if (
-      typeof body.attemptId !== "string" ||
-      typeof body.csrfToken !== "string"
-    ) {
-      throw new PrivyMigrationError(
-        400,
-        "invalid_request",
-        "Migration claim is invalid",
-      );
-    }
-    await requireRateLimit(dependencies.db, {
-      key: `privy-claim:${identitySession.user.id}`,
-      limit: 10,
-      windowMs: 5 * 60_000,
-    });
-    return context.json(
-      await claimPrivyMigration({
-        accessToken,
-        attemptId: body.attemptId,
-        csrfToken: body.csrfToken,
-        db: dependencies.db,
-        gateway: dependencies.privyGateway,
-        userId: identitySession.user.id,
-      }),
-      201,
-    );
-  });
-
-  app.get("/v1/migrations/privy/claims/current", async (context) => {
-    requireSameOrigin(context.req.raw, dependencies.config.baseUrl);
-    const identitySession = await requireIdentitySession(
-      dependencies.auth,
-      context.req.raw.headers,
-    );
-    return context.json({
-      claims: await listCurrentPrivyClaims(
-        dependencies.db,
-        identitySession.user.id,
-      ),
-    });
   });
 
   app.post("/v1/account/wallet/challenges", async (context) => {
@@ -741,9 +632,6 @@ export function createIdentityApp(dependencies: AppDependencies): Hono {
     if (error instanceof IdentityProfileError) {
       return errorResponse(context, error.status, error.message, error.code);
     }
-    if (error instanceof PrivyMigrationError) {
-      return errorResponse(context, error.status, error.message, error.code);
-    }
     if (error instanceof AccountMergeError) {
       return errorResponse(context, error.status, error.message, error.code);
     }
@@ -935,12 +823,12 @@ function accountSecurityHeaders(nonce: string): Record<string, string> {
     "Content-Security-Policy": [
       "default-src 'none'",
       "base-uri 'none'",
-      "child-src https://auth.privy.io https://verify.walletconnect.com https://verify.walletconnect.org",
-      "connect-src 'self' https://auth.privy.io https://*.rpc.privy.systems https://explorer-api.walletconnect.com https://rpc.walletconnect.org https://hcaptcha.com https://*.hcaptcha.com wss://relay.walletconnect.com wss://relay.walletconnect.org wss://www.walletlink.org",
+      "child-src 'none'",
+      "connect-src 'self'",
       "font-src 'self'",
       "form-action 'self'",
       "frame-ancestors 'none'",
-      "frame-src https://auth.privy.io https://verify.walletconnect.com https://verify.walletconnect.org https://challenges.cloudflare.com https://hcaptcha.com https://*.hcaptcha.com",
+      "frame-src 'none'",
       "img-src 'self' data: blob: https:",
       "manifest-src 'self'",
       "object-src 'none'",
@@ -990,24 +878,4 @@ function requireSameOrigin(request: Request, baseUrl: string): void {
     }
   }
   throw new RequestError(403, "Request origin is not allowed");
-}
-
-function bearerToken(request: Request): string {
-  const authorization = request.headers.get("authorization");
-  if (authorization === null || !authorization.startsWith("Bearer ")) {
-    throw new PrivyMigrationError(
-      401,
-      "invalid_proof",
-      "Privy authentication is required",
-    );
-  }
-  const token = authorization.slice(7).trim();
-  if (token.length === 0 || token.length > 16_384) {
-    throw new PrivyMigrationError(
-      401,
-      "invalid_proof",
-      "Privy authentication is invalid",
-    );
-  }
-  return token;
 }

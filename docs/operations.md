@@ -86,27 +86,7 @@ a hosted sign-in and a duplicate-account proof, confirm the provider receives
 the matching exact callback above, and verify the browser returns to
 `/account`. The normal flow must show “Signed in to peezy.tech Identity”; the
 proof flow must show its consolidation preview. Test these separately from
-application OIDC callbacks such as PledgeCash and from the optional Privy Lobby
-migration domain allowlist.
-
-## Legacy Lobby migration bridge
-
-Privy migration is off by default and ordinary startup does not require Privy
-credentials. Deploy the schema and code with `PRIVY_MIGRATION_ENABLED=false`,
-then add `identity.peezy.tech` as an allowed domain on the exact legacy Lobby
-Privy app. Supply that app's ID and secret from the deployment secret store,
-validate `/account` with known multi-identity users, and only then set the flag
-to `true`.
-
-The staging pass must include EVM and Solana identities. Confirm that the Privy
-modal has both connector families, that embedded and external Solana wallets
-can sign the exact SIWS message, and that the child identity transitions from
-`needs_reverification` to `linked` without changing the parent claim.
-
-Privy is a verifier for this bridge, not an Identity sign-in provider. Never log
-its access tokens or place them in URLs. Retirement consists of disabling the
-flag and removing the runtime credentials; retain migration claims, child
-identity provenance, merge tombstones, and audit events. A committed account
+application OIDC callbacks such as PledgeCash. A committed account
 consolidation revokes both subjects' sessions and OAuth material, so the user
 must complete a fresh sign-in to the surviving account.
 

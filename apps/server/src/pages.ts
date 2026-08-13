@@ -11,8 +11,8 @@ export function homePage(input: { signedIn: boolean }): string {
         <p class="lede">
           ${
             input.signedIn
-              ? "You are signed in. Open your account to review your profile, sign-in methods, and optional Lobby migration."
-              : "Create or open your peezy.tech account with Discord, Telegram, X, or a wallet. Privy is only used later to migrate an old Lobby profile."
+              ? "You are signed in. Open your account to review your profile, sign-in methods, and duplicate-account tools."
+              : "Create or open your peezy.tech account with Discord, Telegram, X, or a wallet."
           }
         </p>
         <div class="actions">
@@ -26,14 +26,10 @@ export function homePage(input: { signedIn: boolean }): string {
 }
 
 export function accountPage(
-  config: {
-    privyAppId?: string;
-    providers: SocialProviderName[];
-  },
+  config: { providers: SocialProviderName[] },
   nonce: string,
 ): string {
   const clientConfig = JSON.stringify({
-    privyAppId: config.privyAppId ?? null,
     providers: config.providers,
   }).replaceAll("<", "\\u003c");
   return `<!doctype html>
@@ -88,7 +84,7 @@ export function accountPage(
       <header class="account-heading">
         <span class="account-kicker">Account center</span>
         <h1>Your peezy.tech account.</h1>
-        <p>Update your profile, manage how you sign in, bring over an old Lobby profile, or consolidate duplicate identities.</p>
+        <p>Update your profile, manage how you sign in, or consolidate duplicate identities.</p>
       </header>
       <div id="account-root"><p class="account-loading">Loading your identity…</p></div>
     </div>
@@ -125,7 +121,7 @@ export function signInPage(
         <p class="lede">Choose any method already attached to your peezy.tech account, or use one to create it.</p>
         <div class="identity-note">
           <strong>These are peezy.tech sign-ins.</strong>
-          <span>Privy is not used here. It appears inside your account only when you choose to import an old Lobby profile.</span>
+          <span>Every method below opens the same peezy.tech identity.</span>
         </div>
         ${providers.length > 0 ? '<p class="method-label">Social sign-in</p>' : ""}
         <div class="stack" id="social-providers">${socialButtons}</div>

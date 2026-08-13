@@ -106,15 +106,6 @@ const envSchema = z.object({
   IDENTITY_SECRET: z.string().min(32),
   IDENTITY_TRUSTED_PROXIES: z.string().default(""),
   IDENTITY_TRUSTED_ORIGINS: z.string().default(""),
-  PRIVY_APP_ID: optionalString,
-  PRIVY_APP_SECRET: optionalString,
-  PRIVY_MIGRATION_APP_ID: optionalString,
-  PRIVY_MIGRATION_APP_SECRET: optionalString,
-  PRIVY_MIGRATION_ENABLED: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((value) => value === "true"),
-  PRIVY_MIGRATION_JWT_VERIFICATION_KEY: optionalString,
   TELEGRAM_OAUTH_CLIENT_ID: optionalString,
   TELEGRAM_OAUTH_CLIENT_SECRET: optionalString,
   TWITTER_CLIENT_ID: optionalString,
@@ -136,19 +127,12 @@ export type SocialProviderConfig = {
 export type AppClientConfig = z.infer<typeof appClientSchema>;
 export type OidcClientConfig = z.infer<typeof oidcClientSchema>;
 
-export type PrivyMigrationConfig = {
-  appId: string;
-  appSecret: string;
-  jwtVerificationKey?: string;
-};
-
 export type IdentityConfig = {
   appClients: AppClientConfig[];
   baseUrl: string;
   databaseUrl: string;
   oidcClients: OidcClientConfig[];
   port: number;
-  privyMigration?: PrivyMigrationConfig;
   secret: string;
   socialProviders: Partial<Record<SocialProviderName, SocialProviderConfig>>;
   trustedProxies: string[];
@@ -159,17 +143,6 @@ export function loadConfig(
   env: Record<string, string | undefined> = process.env,
 ): IdentityConfig {
   const parsed = envSchema.parse(env);
-  const privyAppId = parsed.PRIVY_MIGRATION_APP_ID ?? parsed.PRIVY_APP_ID;
-  const privyAppSecret =
-    parsed.PRIVY_MIGRATION_APP_SECRET ?? parsed.PRIVY_APP_SECRET;
-  if (
-    parsed.PRIVY_MIGRATION_ENABLED &&
-    (privyAppId === undefined || privyAppSecret === undefined)
-  ) {
-    throw new Error(
-      "PRIVY_MIGRATION_APP_ID and PRIVY_MIGRATION_APP_SECRET are required when Privy migration is enabled",
-    );
-  }
   for (const appClient of parsed.IDENTITY_APP_CLIENTS) {
     const oidcClient = parsed.IDENTITY_OIDC_CLIENTS.find(
       (client) => client.clientId === appClient.id,
@@ -237,22 +210,6 @@ export function loadConfig(
       (client) => client.clientId,
     ),
     port: parsed.IDENTITY_PORT,
-    ...(parsed.PRIVY_MIGRATION_ENABLED &&
-    privyAppId !== undefined &&
-    privyAppSecret !== undefined
-      ? {
-          privyMigration: {
-            appId: privyAppId,
-            appSecret: privyAppSecret,
-            ...(parsed.PRIVY_MIGRATION_JWT_VERIFICATION_KEY === undefined
-              ? {}
-              : {
-                  jwtVerificationKey:
-                    parsed.PRIVY_MIGRATION_JWT_VERIFICATION_KEY,
-                }),
-          },
-        }
-      : {}),
     secret: parsed.IDENTITY_SECRET,
     socialProviders,
     trustedProxies,

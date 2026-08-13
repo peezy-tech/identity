@@ -12,8 +12,6 @@ import {
   oauthClient,
   oauthConsent,
   oauthRefreshToken,
-  privyMigrationClaim,
-  privyMigrationAttempt,
   session,
   sessionHandoff,
   solanaAuthChallenge,
@@ -272,11 +270,6 @@ export async function commitAccountMerge(input: {
       .update(walletAddress)
       .set({ userId: attempt.targetUserId })
       .where(eq(walletAddress.userId, attempt.sourceUserId));
-    await transaction
-      .update(privyMigrationClaim)
-      .set({ userId: attempt.targetUserId, updatedAt: new Date() })
-      .where(eq(privyMigrationClaim.userId, attempt.sourceUserId));
-
     const userIds = [attempt.sourceUserId, attempt.targetUserId];
     await transaction
       .update(account)
@@ -307,9 +300,6 @@ export async function commitAccountMerge(input: {
     await transaction
       .delete(accountWalletLinkChallenge)
       .where(inArray(accountWalletLinkChallenge.userId, userIds));
-    await transaction
-      .delete(privyMigrationAttempt)
-      .where(inArray(privyMigrationAttempt.userId, userIds));
     await transaction
       .delete(identitySubjectMerge)
       .where(
