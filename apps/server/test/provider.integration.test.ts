@@ -17,7 +17,7 @@ import {
 import bs58 from "bs58";
 import { eq } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
-import { decodeJwt } from "jose";
+import { createLocalJWKSet, decodeJwt, jwtVerify } from "jose";
 import postgres from "postgres";
 import { privateKeyToAccount } from "viem/accounts";
 import { createSiweMessage } from "viem/siwe";
@@ -63,6 +63,9 @@ if (databaseUrl === undefined) {
 } else {
   describe("identity provider integration", () => {
     const origin = "https://pledge.test";
+    const publicOrigin = "https://theater.test";
+    const publicClientId = "public-stream-theater";
+    const publicRedirectUri = "https://theater.test/auth/callback";
     const appSecret = "identity-test-app-secret-0123456789";
     const oidcSecret = "identity-test-oidc-secret-01234567";
     const subject = "9bb64f50-80eb-48e3-999e-c4712e752461";
@@ -94,6 +97,16 @@ if (databaseUrl === undefined) {
           name: "PledgeCash",
           redirectUris: ["https://pledge.test/auth/callback/peezy"],
           requireHandle: false,
+          type: "confidential",
+        },
+        {
+          audiences: [],
+          clientId: publicClientId,
+          name: "Public Stream Theater",
+          origins: [publicOrigin],
+          redirectUris: [publicRedirectUri],
+          requireHandle: false,
+          type: "public-browser",
         },
       ],
       port: 8790,
@@ -148,12 +161,18 @@ if (databaseUrl === undefined) {
       expect(metadataResponse.status).toBe(200);
       const metadata = (await metadataResponse.json()) as {
         authorization_endpoint: string;
+        code_challenge_methods_supported: string[];
+        grant_types_supported: string[];
         issuer: string;
+        token_endpoint_auth_methods_supported: string[];
       };
       expect(metadata.issuer).toBe("https://identity.test/api/auth");
       expect(metadata.authorization_endpoint).toBe(
         "https://identity.test/api/auth/oauth2/authorize",
       );
+      expect(metadata.code_challenge_methods_supported).toContain("S256");
+      expect(metadata.grant_types_supported).toContain("authorization_code");
+      expect(metadata.token_endpoint_auth_methods_supported).toContain("none");
 
       const now = new Date("2026-07-29T00:00:00.000Z");
       await database.db.insert(user).values({
@@ -172,6 +191,399 @@ if (databaseUrl === undefined) {
       expect(
         identity.credentials.some((credential) => credential.kind === "wallet"),
       ).toBe(false);
+    });
+
+    test("completes a public browser authorization-code flow with PKCE and narrow CORS", async () => {
+      const [persistedClient] = await database.sql<
+        {
+          clientSecret: string | null;
+          grantTypes: string[];
+          public: boolean;
+          redirectUris: string[];
+          requirePKCE: boolean;
+          scopes: string[];
+          tokenEndpointAuthMethod: string;
+          type: string;
+        }[]
+      >`
+        SELECT
+          "client_secret" AS "clientSecret",
+          "grant_types" AS "grantTypes",
+          "public",
+          "redirect_uris" AS "redirectUris",
+          "require_pkce" AS "requirePKCE",
+          "scopes",
+          "token_endpoint_auth_method" AS "tokenEndpointAuthMethod",
+          "type"
+        FROM "oauth_client"
+        WHERE "client_id" = ${publicClientId}
+      `;
+      expect(persistedClient).toEqual({
+        clientSecret: null,
+        grantTypes: ["authorization_code"],
+        public: true,
+        redirectUris: [publicRedirectUri],
+        requirePKCE: true,
+        scopes: ["openid", "profile"],
+        tokenEndpointAuthMethod: "none",
+        type: "user-agent-based",
+      });
+
+      const metadataResponse = await app.request(
+        "https://identity.test/api/auth/.well-known/openid-configuration",
+        { headers: { Origin: publicOrigin } },
+      );
+      expect(metadataResponse.status).toBe(200);
+      expect(metadataResponse.headers.get("access-control-allow-origin")).toBe(
+        publicOrigin,
+      );
+      expect(metadataResponse.headers.get("vary")).toContain("Origin");
+
+      const preflight = await app.request(
+        "https://identity.test/api/auth/oauth2/token",
+        {
+          headers: {
+            "Access-Control-Request-Headers": "content-type",
+            "Access-Control-Request-Method": "POST",
+            Origin: publicOrigin,
+          },
+          method: "OPTIONS",
+        },
+      );
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get("access-control-allow-origin")).toBe(
+        publicOrigin,
+      );
+      expect(preflight.headers.get("access-control-allow-methods")).toContain(
+        "POST",
+      );
+      expect(preflight.headers.get("access-control-allow-headers")).toContain(
+        "Content-Type",
+      );
+
+      const rejectedPreflight = await app.request(
+        "https://identity.test/api/auth/oauth2/token",
+        {
+          headers: {
+            "Access-Control-Request-Method": "POST",
+            Origin: "https://attacker.invalid",
+          },
+          method: "OPTIONS",
+        },
+      );
+      expect(
+        rejectedPreflight.headers.get("access-control-allow-origin"),
+      ).toBeNull();
+      const accountRequest = await app.request("https://identity.test/v1/me", {
+        headers: { Origin: publicOrigin },
+      });
+      expect(accountRequest.status).toBe(401);
+      expect(
+        accountRequest.headers.get("access-control-allow-origin"),
+      ).toBeNull();
+      const unrelatedAuthPreflight = await app.request(
+        "https://identity.test/api/auth/siwe/nonce",
+        {
+          headers: {
+            "Access-Control-Request-Method": "POST",
+            Origin: publicOrigin,
+          },
+          method: "OPTIONS",
+        },
+      );
+      expect(
+        unrelatedAuthPreflight.headers.get("access-control-allow-origin"),
+      ).toBeNull();
+
+      const publicWallet = privateKeyToAccount(
+        `0x${randomBytes(32).toString("hex")}`,
+      );
+      const signedIn = await signInHostedWallet(app, config, publicWallet);
+      await database.db
+        .update(user)
+        .set({
+          handle: "arena-goer",
+          image: "https://images.example.test/arena-goer.png",
+          name: "Arena Goer",
+          updatedAt: new Date(),
+        })
+        .where(eq(user.id, signedIn.userId));
+
+      const missingPkce = await requestPublicAuthorization({
+        app,
+        identityCookie: signedIn.cookie,
+        publicClientId,
+        publicRedirectUri,
+      });
+      expectAuthorizationError(missingPkce, publicRedirectUri);
+
+      const plainPkce = await requestPublicAuthorization({
+        app,
+        codeChallenge: randomBytes(32).toString("base64url"),
+        codeChallengeMethod: "plain",
+        identityCookie: signedIn.cookie,
+        publicClientId,
+        publicRedirectUri,
+      });
+      expectAuthorizationError(plainPkce, publicRedirectUri);
+
+      const wrongRedirect = await requestPublicAuthorization({
+        app,
+        codeChallenge: randomBytes(32).toString("base64url"),
+        codeChallengeMethod: "S256",
+        identityCookie: signedIn.cookie,
+        publicClientId,
+        publicRedirectUri: "https://attacker.invalid/auth/callback",
+      });
+      expect([302, 400]).toContain(wrongRedirect.status);
+      const wrongRedirectLocation = wrongRedirect.headers.get("location") ?? "";
+      expect(wrongRedirectLocation).not.toContain("attacker.invalid");
+      expect(
+        new URL(wrongRedirectLocation, config.baseUrl).searchParams.get("code"),
+      ).toBeNull();
+
+      const otherClientRedirect = await requestPublicAuthorization({
+        app,
+        codeChallenge: randomBytes(32).toString("base64url"),
+        codeChallengeMethod: "S256",
+        identityCookie: signedIn.cookie,
+        publicClientId,
+        publicRedirectUri: "https://pledge.test/auth/callback/peezy",
+      });
+      expect([302, 400]).toContain(otherClientRedirect.status);
+      const otherRedirectLocation =
+        otherClientRedirect.headers.get("location") ?? "";
+      expect(otherRedirectLocation).not.toContain("pledge.test");
+      expect(
+        new URL(otherRedirectLocation, config.baseUrl).searchParams.get("code"),
+      ).toBeNull();
+
+      const authorization = await authorizePublicCode({
+        app,
+        identityCookie: signedIn.cookie,
+        publicClientId,
+        publicRedirectUri,
+      });
+      const tokenResponse = await exchangePublicAuthorizationCode({
+        app,
+        code: authorization.code,
+        codeVerifier: authorization.codeVerifier,
+        origin: publicOrigin,
+        publicClientId,
+        publicRedirectUri,
+      });
+      expect(tokenResponse.status).toBe(200);
+      expect(tokenResponse.headers.get("access-control-allow-origin")).toBe(
+        publicOrigin,
+      );
+      const tokens = (await tokenResponse.json()) as {
+        access_token: string;
+        id_token: string;
+        refresh_token?: string;
+      };
+      expect(tokens.refresh_token).toBeUndefined();
+
+      const jwksResponse = await app.request(
+        "https://identity.test/api/auth/jwks",
+        { headers: { Origin: publicOrigin } },
+      );
+      expect(jwksResponse.status).toBe(200);
+      expect(jwksResponse.headers.get("access-control-allow-origin")).toBe(
+        publicOrigin,
+      );
+      const jwks = (await jwksResponse.json()) as Parameters<
+        typeof createLocalJWKSet
+      >[0];
+      const verified = await jwtVerify(
+        tokens.id_token,
+        createLocalJWKSet(jwks),
+        {
+          audience: publicClientId,
+          issuer: "https://identity.test/api/auth",
+        },
+      );
+      expect(verified.payload).toMatchObject({
+        aud: publicClientId,
+        name: "Arena Goer",
+        nonce: authorization.nonce,
+        picture: "https://images.example.test/arena-goer.png",
+        preferred_username: "arena-goer",
+        sub: signedIn.userId,
+      });
+
+      const userInfo = await app.request(
+        "https://identity.test/api/auth/oauth2/userinfo",
+        {
+          headers: {
+            Authorization: `Bearer ${tokens.access_token}`,
+            Origin: publicOrigin,
+          },
+        },
+      );
+      expect(userInfo.status).toBe(200);
+      expect(userInfo.headers.get("access-control-allow-origin")).toBe(
+        publicOrigin,
+      );
+      expect(await userInfo.json()).toMatchObject({
+        name: "Arena Goer",
+        picture: "https://images.example.test/arena-goer.png",
+        preferred_username: "arena-goer",
+        sub: signedIn.userId,
+      });
+
+      const reusedCode = await exchangePublicAuthorizationCode({
+        app,
+        code: authorization.code,
+        codeVerifier: authorization.codeVerifier,
+        origin: publicOrigin,
+        publicClientId,
+        publicRedirectUri,
+      });
+      expect(reusedCode.status).toBe(400);
+
+      const missingVerifierAuthorization = await authorizePublicCode({
+        app,
+        identityCookie: signedIn.cookie,
+        publicClientId,
+        publicRedirectUri,
+      });
+      expect(
+        (
+          await exchangePublicAuthorizationCode({
+            app,
+            code: missingVerifierAuthorization.code,
+            origin: publicOrigin,
+            publicClientId,
+            publicRedirectUri,
+          })
+        ).status,
+      ).toBe(400);
+
+      const wrongVerifierAuthorization = await authorizePublicCode({
+        app,
+        identityCookie: signedIn.cookie,
+        publicClientId,
+        publicRedirectUri,
+      });
+      expect(
+        (
+          await exchangePublicAuthorizationCode({
+            app,
+            code: wrongVerifierAuthorization.code,
+            codeVerifier: randomBytes(32).toString("base64url"),
+            origin: publicOrigin,
+            publicClientId,
+            publicRedirectUri,
+          })
+        ).status,
+      ).toBe(401);
+
+      const secretAuthorization = await authorizePublicCode({
+        app,
+        identityCookie: signedIn.cookie,
+        publicClientId,
+        publicRedirectUri,
+      });
+      expect(
+        (
+          await exchangePublicAuthorizationCode({
+            app,
+            clientSecret: "public-clients-must-not-send-this-secret",
+            code: secretAuthorization.code,
+            codeVerifier: secretAuthorization.codeVerifier,
+            origin: publicOrigin,
+            publicClientId,
+            publicRedirectUri,
+          })
+        ).status,
+      ).toBe(400);
+
+      const expiredAuthorization = await authorizePublicCode({
+        app,
+        identityCookie: signedIn.cookie,
+        publicClientId,
+        publicRedirectUri,
+      });
+      await database.sql`
+        UPDATE "verification"
+        SET "expires_at" = now() - interval '1 second'
+        WHERE "identifier" = ${createHash("sha256")
+          .update("peezy-identity-verification:primary\0")
+          .update(
+            createHash("sha256")
+              .update(expiredAuthorization.code)
+              .digest("base64url"),
+          )
+          .digest("hex")}
+      `;
+      expect(
+        (
+          await exchangePublicAuthorizationCode({
+            app,
+            code: expiredAuthorization.code,
+            codeVerifier: expiredAuthorization.codeVerifier,
+            origin: publicOrigin,
+            publicClientId,
+            publicRedirectUri,
+          })
+        ).status,
+      ).toBe(400);
+
+      const clientCredentials = await app.request(
+        "https://identity.test/api/auth/oauth2/token",
+        {
+          body: new URLSearchParams({
+            client_id: publicClientId,
+            grant_type: "client_credentials",
+          }),
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            Origin: publicOrigin,
+          },
+          method: "POST",
+        },
+      );
+      expect(clientCredentials.status).toBe(400);
+      const introspection = await app.request(
+        "https://identity.test/api/auth/oauth2/introspect",
+        {
+          body: new URLSearchParams({
+            client_id: publicClientId,
+            token: tokens.access_token,
+          }),
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          method: "POST",
+        },
+      );
+      expect(introspection.status).toBe(401);
+    });
+
+    test("does not advertise public token authentication without a configured public client", async () => {
+      const confidentialConfig = {
+        ...config,
+        oidcClients: config.oidcClients.filter(
+          (client) => client.type === "confidential",
+        ),
+      };
+      const { auth, socialProviderNames } = createIdentityAuth(
+        confidentialConfig,
+        database.db,
+      );
+      const confidentialApp = createIdentityApp({
+        auth,
+        config: confidentialConfig,
+        db: database.db,
+        proofAuth: createIdentityProofAuth(confidentialConfig, database.db),
+        socialProviderNames,
+      });
+      const metadata = (await (
+        await confidentialApp.request(
+          "https://identity.test/api/auth/.well-known/openid-configuration",
+        )
+      ).json()) as { token_endpoint_auth_methods_supported: string[] };
+      expect(metadata.token_endpoint_auth_methods_supported).not.toContain(
+        "none",
+      );
     });
 
     test("lands hosted sign-ins on a session-aware account route", async () => {
@@ -2113,6 +2525,15 @@ if (databaseUrl === undefined) {
         FROM "oauth_client"
         WHERE "client_id" = 'pledge-cash'
       `;
+      const [configuredPublicOidc] = await database.sql<
+        { clientSecret: string | null; disabled: boolean }[]
+      >`
+        SELECT
+          "client_secret" AS "clientSecret",
+          "disabled"
+        FROM "oauth_client"
+        WHERE "client_id" = 'public-stream-theater'
+      `;
       const [configuredResource] = await database.sql<{ disabled: boolean }[]>`
         SELECT "disabled"
         FROM "oauth_resource"
@@ -2125,6 +2546,10 @@ if (databaseUrl === undefined) {
       `;
       expect(configuredApp?.disabled).toBe(true);
       expect(configuredOidc?.disabled).toBe(true);
+      expect(configuredPublicOidc).toEqual({
+        clientSecret: null,
+        disabled: true,
+      });
       expect(configuredResource?.disabled).toBe(true);
       expect(configuredResourceLinks?.count).toBe("0");
     });
@@ -2233,6 +2658,121 @@ async function waitForDatabaseWaitEvent(input: {
     await Bun.sleep(5);
   }
   throw new Error(`No database backend entered ${input.event}`);
+}
+
+async function requestPublicAuthorization(input: {
+  app: ReturnType<typeof createIdentityApp>;
+  codeChallenge?: string;
+  codeChallengeMethod?: string;
+  identityCookie: string;
+  nonce?: string;
+  publicClientId: string;
+  publicRedirectUri: string;
+}): Promise<Response> {
+  const authorizationUrl = new URL(
+    "https://identity.test/api/auth/oauth2/authorize",
+  );
+  authorizationUrl.searchParams.set("client_id", input.publicClientId);
+  authorizationUrl.searchParams.set("redirect_uri", input.publicRedirectUri);
+  authorizationUrl.searchParams.set("response_type", "code");
+  authorizationUrl.searchParams.set("scope", "openid profile");
+  authorizationUrl.searchParams.set(
+    "state",
+    randomBytes(16).toString("base64url"),
+  );
+  if (input.codeChallenge !== undefined) {
+    authorizationUrl.searchParams.set("code_challenge", input.codeChallenge);
+  }
+  if (input.codeChallengeMethod !== undefined) {
+    authorizationUrl.searchParams.set(
+      "code_challenge_method",
+      input.codeChallengeMethod,
+    );
+  }
+  if (input.nonce !== undefined) {
+    authorizationUrl.searchParams.set("nonce", input.nonce);
+  }
+  return await input.app.request(authorizationUrl, {
+    headers: { Cookie: input.identityCookie },
+  });
+}
+
+function expectAuthorizationError(
+  response: Response,
+  publicRedirectUri: string,
+): void {
+  expect(response.status).toBe(302);
+  const location = response.headers.get("location");
+  if (location === null) {
+    throw new Error("OIDC authorization error did not redirect");
+  }
+  const redirect = new URL(location);
+  expect(`${redirect.origin}${redirect.pathname}`).toBe(publicRedirectUri);
+  expect(redirect.searchParams.get("error")).not.toBeNull();
+  expect(redirect.searchParams.get("code")).toBeNull();
+}
+
+async function authorizePublicCode(input: {
+  app: ReturnType<typeof createIdentityApp>;
+  identityCookie: string;
+  publicClientId: string;
+  publicRedirectUri: string;
+}): Promise<{ code: string; codeVerifier: string; nonce: string }> {
+  const codeVerifier = randomBytes(32).toString("base64url");
+  const codeChallenge = createHash("sha256")
+    .update(codeVerifier)
+    .digest("base64url");
+  const nonce = randomBytes(24).toString("base64url");
+  const response = await requestPublicAuthorization({
+    ...input,
+    codeChallenge,
+    codeChallengeMethod: "S256",
+    nonce,
+  });
+  expect(response.status).toBe(302);
+  const location = response.headers.get("location");
+  if (location === null) {
+    throw new Error("Public OIDC authorization did not redirect");
+  }
+  const code = new URL(location).searchParams.get("code");
+  if (code === null) {
+    throw new Error("Public OIDC authorization returned no code");
+  }
+  return { code, codeVerifier, nonce };
+}
+
+async function exchangePublicAuthorizationCode(input: {
+  app: ReturnType<typeof createIdentityApp>;
+  clientSecret?: string;
+  code: string;
+  codeVerifier?: string;
+  origin: string;
+  publicClientId: string;
+  publicRedirectUri: string;
+}): Promise<Response> {
+  const body = new URLSearchParams({
+    client_id: input.publicClientId,
+    code: input.code,
+    grant_type: "authorization_code",
+    redirect_uri: input.publicRedirectUri,
+  });
+  if (input.codeVerifier !== undefined) {
+    body.set("code_verifier", input.codeVerifier);
+  }
+  if (input.clientSecret !== undefined) {
+    body.set("client_secret", input.clientSecret);
+  }
+  return await input.app.request(
+    "https://identity.test/api/auth/oauth2/token",
+    {
+      body,
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Origin: input.origin,
+      },
+      method: "POST",
+    },
+  );
 }
 
 async function authorizeCode(input: {

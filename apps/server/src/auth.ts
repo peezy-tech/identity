@@ -2,7 +2,10 @@ import { createHash, randomBytes } from "node:crypto";
 
 import { PeezyHandleSchema } from "@peezy.tech/identity";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
-import { oauthProvider } from "@better-auth/oauth-provider";
+import {
+  oauthProvider,
+  type OAuthProviderExtension,
+} from "@better-auth/oauth-provider";
 import { betterAuth, type BetterAuthPlugin } from "better-auth";
 import { APIError } from "better-auth/api";
 import { genericOAuth, jwt, siwe } from "better-auth/plugins";
@@ -37,6 +40,14 @@ type TelegramOAuthTokens = {
 };
 
 type IdentityAuthMode = "primary" | "proof";
+
+const configuredPublicClientCapability: OAuthProviderExtension = {
+  clientDiscovery: {
+    id: "configured-public-client-capability",
+    matches: () => false,
+    resolve: () => null,
+  },
+};
 
 export function createIdentityAuth(config: IdentityConfig, db: IdentityDb) {
   return createConfiguredIdentityAuth(config, db, "primary");
@@ -87,6 +98,9 @@ function createConfiguredIdentityAuth(
   const resourceAudiences = [
     ...new Set(config.oidcClients.flatMap((client) => client.audiences)),
   ];
+  const supportsPublicClients = config.oidcClients.some(
+    (client) => client.type === "public-browser",
+  );
   const providerPlugin = oauthProvider({
     accessTokenExpiresIn: 10 * 60,
     advertisedMetadata: {
@@ -115,11 +129,13 @@ function createConfiguredIdentityAuth(
     clientPrivileges: () => false,
     codeExpiresIn: 5 * 60,
     consentPage: "/consent",
-    customIdTokenClaims: ({ scopes, user }) =>
-      preferredUsernameClaims(user, scopes),
-    customUserInfoClaims: ({ scopes, user }) =>
-      preferredUsernameClaims(user, scopes),
+    customIdTokenClaims: ({ scopes, user }) => profileClaims(user, scopes),
+    customUserInfoClaims: ({ scopes, user }) => profileClaims(user, scopes),
     enforcePerClientResources: true,
+    // oauth-provider advertises `none` when a client-discovery capability is
+    // present. This marker exposes pre-registered public rows without resolving
+    // arbitrary clients or enabling dynamic client registration.
+    extensions: supportsPublicClients ? [configuredPublicClientCapability] : [],
     idTokenExpiresIn: 10 * 60,
     loginPage: "/sign-in",
     refreshTokenExpiresIn: 30 * 24 * 60 * 60,
@@ -280,13 +296,21 @@ function createConfiguredIdentityAuth(
   return { auth, socialProviderNames };
 }
 
-function preferredUsernameClaims(
+function profileClaims(
   user: Record<string, unknown>,
   scopes: readonly string[],
 ): Record<string, string> {
   if (!scopes.includes("profile")) return {};
+  const claims: Record<string, string> = {};
+  if (typeof user.name === "string" && user.name.length > 0) {
+    claims.name = user.name;
+  }
+  if (typeof user.image === "string" && user.image.length > 0) {
+    claims.picture = user.image;
+  }
   const handle = PeezyHandleSchema.safeParse(user.handle);
-  return handle.success ? { preferred_username: handle.data } : {};
+  if (handle.success) claims.preferred_username = handle.data;
+  return claims;
 }
 
 function createIdentityDatabaseAdapter(

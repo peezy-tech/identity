@@ -18,6 +18,11 @@ authorization remains in each product:
 PledgeCash, for example, continues to own alert preferences, notification
 channels, subscriptions, and fresh Boardroom-control proofs.
 
+Identity also supports explicitly registered public browser clients through
+authorization code + PKCE-S256. These clients hold no secret and may use only
+cosmetic profile identity unless a product introduces a separate server-side
+authorization boundary.
+
 ## Packages
 
 - `@peezy.tech/identity`: versioned public contracts and a small HTTP client.

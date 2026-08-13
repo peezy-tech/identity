@@ -18,6 +18,50 @@ next successful start. Resource audiences and client-to-resource grants are
 reconciled in the same transaction, so a removed audience is disabled and its
 config-managed grants are deleted before the service begins listening.
 
+## OIDC client registration
+
+Every entry in `IDENTITY_OIDC_CLIENTS` declares its `type` explicitly:
+
+- `confidential` clients require a distinct `clientSecret`, use
+  `client_secret_basic`, and retain the current authorization-code and refresh
+  behavior. They must not declare browser `origins`.
+- `public-browser` clients forbid `clientSecret`, require one or more exact
+  `origins`, use token authentication method `none`, and receive only
+  authorization-code grants with PKCE-S256 and `openid profile` scopes.
+
+Redirect URIs are exact allowlist entries. Public-client redirect origins must
+also appear in that client's origin list. Remote entries require HTTPS;
+loopback HTTP is allowed only for local development. Wildcards, credentials,
+fragments, and path-bearing origin entries are rejected at startup. A public
+client ID is intentionally non-secret and may be shipped in browser assets.
+
+The combined origins of enabled public clients receive CORS only on:
+
+- `/api/auth/.well-known/openid-configuration`;
+- `/api/auth/oauth2/token`;
+- `/api/auth/oauth2/userinfo`; and
+- `/api/auth/jwks`.
+
+These responses never use wildcard origins or credentialed CORS. Registering a
+public client does not add its origins to `IDENTITY_TRUSTED_ORIGINS` and does
+not grant cross-origin access to `/v1/*`, hosted session endpoints, account
+management, wallet grants, or proof flows.
+
+To add or change a public client, review every redirect and origin literally,
+update deployment configuration, and restart Identity so client seeding is one
+transaction. Verify discovery advertises `none`, an allowed-origin preflight
+succeeds, an unregistered origin receives no CORS grant, and a real code + PKCE
+exchange works without a secret. Removing the entry and restarting disables
+the managed client atomically; stale registrations cannot authorize or exchange
+new codes.
+
+Rollback the service image and its matching configuration together. If a
+public-client rollout must be withdrawn without rolling back code, remove its
+entry, restart, and verify the row is disabled. Public clients have no secret
+to rotate. Rotate a confidential client secret by replacing it in the protected
+runtime environment and restarting; coordinate the consumer cutover so the old
+secret is not assumed to remain usable.
+
 ## Network edge
 
 Terminate TLS at `identity.peezy.tech` and make the service origin reachable
